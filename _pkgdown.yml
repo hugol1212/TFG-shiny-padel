@@ -1,0 +1,14 @@
+url: ~
+destination: inst/app/www/docs
+template:
+  bootstrap: 5
+  light-switch: true
+  bslib:
+    bg: "#000"
+    fg: "#001F66"
+    primary: "#0d6efd"
+    base_font: {google: "Inter"}
+    code_font: {google: "JetBrains Mono"}
+authors:
+  First Last:
+    href: https://example.com/

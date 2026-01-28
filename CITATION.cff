@@ -1,0 +1,24 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: template.shiny.app
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - name: DSLAB URJC
+    website: 'https://www.datasciencelab.es/'
+    address: 'Tulipán Street, no number'
+    city: Móstoles
+    country: ES
+    post-code: '28933'
+    location: Department Building II
+    region: Madrid
+  - given-names: First
+    affiliation: DSLAB URJC
+    orcid: 'https://orcid.org/0000-0000-0000-0000'
+    family-names: Last
+repository-code: 'https://github.com/URJCDSLab/template_shiny_app/'
+version: 0.0.0.9000
