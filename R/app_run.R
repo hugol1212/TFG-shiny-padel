@@ -17,6 +17,10 @@
 #'
 #' @examplesIf interactive()
 #' app_run()
+#' 
+#' 
+# app_run.R
+
 app_run <- function(.port = 3838, .host = "127.0.0.1", .dev = FALSE) {
   if (.dev) {
     shiny::devmode(TRUE, verbose = TRUE)
