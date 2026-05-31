@@ -1,4 +1,4 @@
-#' Run shiny application
+
 #'
 #' Runs the shiny app, keeping listening in a given port (by default 3838).
 #' The default host address is 0.0.0.0. It may be changed to 127.0.0.1 to be

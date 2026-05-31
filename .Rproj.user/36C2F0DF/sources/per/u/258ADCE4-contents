@@ -1,0 +1,2843 @@
+# R/app_server.R
+
+library(shiny)
+library(DT)
+library(plotly)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(stringi)
+library(tibble)
+library(purrr)
+library(ggplot2)
+
+source("R/functions_data.R")
+source("R/functions_plot.R")
+
+app_server <- function(input, output, session) {
+  
+  data <- load_data()
+  
+  seasons_all <- sort(unique(c(
+    data$calendar$season,
+    data$finance$season,
+    data$matches$season,
+    data$satellites$season
+  )))
+  
+  shiny::updateSelectInput(
+    session,
+    inputId = "season",
+    choices = seasons_all,
+    selected = seasons_all[length(seasons_all)]
+  )
+  
+  detect_trimestre <- function(x) {
+    x_norm <- x |>
+      as.character() |>
+      stringi::stri_trans_general("Latin-ASCII") |>
+      toupper()
+    
+    dplyr::case_when(
+      stringr::str_detect(x_norm, "INVIERNO")  ~ "INVIERNO",
+      stringr::str_detect(x_norm, "OTONO")     ~ "OTOÑO",
+      stringr::str_detect(x_norm, "PRIMAVERA") ~ "PRIMAVERA",
+      stringr::str_detect(x_norm, "VERANO")    ~ "VERANO",
+      TRUE ~ "OTROS"
+    )
+  }
+  
+  matches_base <- shiny::reactive({
+    data$matches %>%
+      dplyr::mutate(trimestre = detect_trimestre(source_sheet))
+  })
+  
+  satellites_base <- shiny::reactive({
+    df <- data$satellites %>%
+      dplyr::mutate(
+        pareja_a = as.character(pareja_a),
+        pareja_b = as.character(pareja_b)
+      )
+    
+    fixed <- purrr::map2_dfr(df$pareja_a, df$pareja_b, fix_leaked_initials_row)
+    
+    df %>%
+      dplyr::mutate(
+        pareja_a = fixed$pareja_a,
+        pareja_b = fixed$pareja_b,
+        trimestre = detect_trimestre(source_sheet)
+      )
+  })
+  
+  satellites_f <- shiny::reactive({
+    sb <- satellites_base()
+    
+    if (!is.null(input$season)) sb <- dplyr::filter(sb, season == input$season)
+    if (!is.null(input$trimestre) && input$trimestre != "__ALL__") sb <- dplyr::filter(sb, trimestre == input$trimestre)
+    if (!is.null(input$jornada) && input$jornada != "__ALL__") sb <- dplyr::filter(sb, jornada == as.integer(input$jornada))
+    
+    sb
+  })
+  
+  cal_f <- shiny::reactive({
+    if (is.null(input$season)) return(data$calendar)
+    dplyr::filter(data$calendar, season == input$season)
+  })
+  
+  fin_f <- shiny::reactive({
+    if (is.null(input$season)) return(data$finance)
+    dplyr::filter(data$finance, season == input$season)
+  })
+  
+  observeEvent(input$season, {
+    mb <- matches_base()
+    mb_season <- if (!is.null(input$season)) dplyr::filter(mb, season == input$season) else mb
+    
+    tr_choices <- sort(unique(mb_season$trimestre))
+    tr_choices <- tr_choices[!is.na(tr_choices) & tr_choices != ""]
+    
+    shiny::updateSelectInput(
+      session,
+      inputId = "trimestre",
+      choices = c("Todos" = "__ALL__", tr_choices),
+      selected = "__ALL__"
+    )
+    
+    j_choices <- sort(unique(mb_season$jornada))
+    j_choices <- j_choices[!is.na(j_choices)]
+    
+    shiny::updateSelectInput(
+      session,
+      inputId = "jornada",
+      choices = c("Todas" = "__ALL__", j_choices),
+      selected = "__ALL__"
+    )
+  }, ignoreInit = FALSE)
+  
+  matches_f <- shiny::reactive({
+    mb <- matches_base()
+    
+    if (!is.null(input$season)) mb <- dplyr::filter(mb, season == input$season)
+    if (!is.null(input$trimestre) && input$trimestre != "__ALL__") mb <- dplyr::filter(mb, trimestre == input$trimestre)
+    if (!is.null(input$jornada) && input$jornada != "__ALL__") mb <- dplyr::filter(mb, jornada == as.integer(input$jornada))
+    
+    mb
+  })
+  
+  # ----------------------------
+  # TABLAS (DEBUG)
+  # ----------------------------
+  output$tbl_matches <- DT::renderDT({
+    DT::datatable(
+      as.data.frame(matches_f()),
+      options = list(pageLength = 25, scrollX = TRUE),
+      class = "nowrap"
+    )
+  })
+  
+  players_f <- shiny::reactive({ make_player_stats(matches_f()) })
+  
+  output$tbl_players <- DT::renderDT({
+    DT::datatable(
+      as.data.frame(players_f()),
+      options = list(pageLength = 25, scrollX = TRUE),
+      class = "nowrap"
+    )
+  })
+  
+  output$tbl_calendar <- DT::renderDT({
+    cal_show <- cal_f() %>%
+      dplyr::select(
+        season, ano, trimestre, jornada, fecha, sede,
+        pareja_bloqueada_alta, pareja_bloqueada_baja,
+        jornada_de_ascenso_descenso, notas, n_mero_de_asistentes
+      ) %>%
+      dplyr::rename(asistentes = n_mero_de_asistentes) %>%
+      dplyr::mutate(fecha = format(fecha, "%d/%m/%Y"))
+    
+    DT::datatable(
+      as.data.frame(cal_show),
+      options = list(pageLength = 20, scrollX = TRUE, autoWidth = TRUE),
+      class = "nowrap"
+    )
+  })
+  
+  output$tbl_finance <- DT::renderDT({
+    fin_show <- fin_f() %>%
+      dplyr::select(season, jornada, fecha, bote, gasto_bolas, montados, otros_gastos) %>%
+      dplyr::mutate(fecha = format(fecha, "%d/%m/%Y"))
+    
+    DT::datatable(
+      as.data.frame(fin_show),
+      options = list(pageLength = 20, scrollX = TRUE, autoWidth = TRUE),
+      class = "nowrap"
+    )
+  })
+  
+  output$tbl_satellites <- DT::renderDT({
+    DT::datatable(
+      as.data.frame(satellites_f()),
+      options = list(pageLength = 25, scrollX = TRUE),
+      class = "nowrap"
+    )
+  })
+  
+  players_sat_f <- shiny::reactive({ make_player_stats_satellites(satellites_f()) })
+  
+  output$tbl_players_sat <- DT::renderDT({
+    DT::datatable(
+      as.data.frame(players_sat_f()),
+      options = list(pageLength = 25, scrollX = TRUE),
+      class = "nowrap"
+    )
+  })
+  
+  players_total_f <- shiny::reactive({ make_player_stats_total(players_f(), players_sat_f()) })
+  
+  output$tbl_players_total <- DT::renderDT({
+    df <- rename_total_cols_es(players_total_f())
+    DT::datatable(
+      as.data.frame(df),
+      options = list(pageLength = 25, scrollX = TRUE),
+      class = "nowrap"
+    )
+  })
+  
+  # ---- Gráfico Top N (Resumen) ----
+  output$plot_top_total <- shiny::renderPlot({
+    n <- if (is.null(input$top_n)) 10 else as.integer(input$top_n)
+    plot_top_players_total(players_total_f(), n = n)
+  })
+  
+  # ---- KPIs Resumen ----
+  output$kpi_players_unique <- shiny::renderText({
+    df <- players_total_f() %>% dplyr::filter(!is.na(total_puntuacion), jugador != "")
+    nrow(df)
+  })
+  
+  output$kpi_max_points <- shiny::renderText({
+    df <- players_total_f() %>% dplyr::filter(!is.na(total_puntuacion), jugador != "")
+    mx <- max(as.numeric(df$total_puntuacion), na.rm = TRUE)
+    format(round(mx, 1), big.mark = ".", decimal.mark = ",", nsmall = 1)
+  })
+  
+  output$kpi_top_player <- shiny::renderText({
+    df <- players_total_f() %>%
+      dplyr::filter(!is.na(total_puntuacion), jugador != "") %>%
+      dplyr::arrange(dplyr::desc(total_puntuacion)) %>%
+      dplyr::slice_head(n = 1)
+    if (nrow(df) == 0) return("-")
+    df$jugador[1]
+  })
+  
+  # Rellenar selector jugador
+  shiny::observeEvent(players_total_f(), {
+    choices <- players_total_f() %>% dplyr::arrange(jugador) %>% dplyr::pull(jugador)
+    if (length(choices) == 0) return()
+    shiny::updateSelectInput(session, "player_sel", choices = choices, selected = choices[1])
+  }, ignoreInit = TRUE)
+  
+  # Dataset por jornada TOTAL
+  players_by_jornada_f <- shiny::reactive({
+    req(input$season)
+    
+    df_cuadro <- matches_base() %>% dplyr::filter(season == input$season)
+    df_sat    <- satellites_base() %>% dplyr::filter(season == input$season)
+    
+    if (!is.null(input$trimestre) && input$trimestre != "__ALL__") {
+      df_cuadro <- dplyr::filter(df_cuadro, trimestre == input$trimestre)
+      df_sat    <- dplyr::filter(df_sat, trimestre == input$trimestre)
+    }
+    
+    make_player_stats_by_jornada_total(df_cuadro, df_sat)
+  })
+  
+  # Rellenar selector desde dataset por jornada
+  shiny::observeEvent(players_by_jornada_f(), {
+    dfj <- players_by_jornada_f()
+    choices <- dfj %>% dplyr::distinct(jugador) %>% dplyr::arrange(jugador) %>% dplyr::pull(jugador)
+    if (length(choices) == 0) return()
+    shiny::updateSelectInput(session, "player_sel", choices = choices, selected = choices[1])
+  }, ignoreInit = TRUE)
+  
+  # Plot evolución jugador
+  output$plot_player_evolution <- shiny::renderPlot({
+    req(input$player_sel)
+    plot_player_evolution(players_by_jornada_f(), input$player_sel)
+  })
+  
+  # KPIs jugador
+  player_row_total_f <- shiny::reactive({
+    req(input$player_sel)
+    df <- players_total_f()
+    
+    key_norm_local <- function(x) {
+      x <- as.character(x)
+      x <- stringi::stri_trans_general(x, "Latin-ASCII")
+      x <- toupper(x)
+      stringr::str_squish(x)
+    }
+    
+    df <- df %>% mutate(jugador_key = key_norm_local(jugador))
+    row <- df %>% filter(jugador_key == key_norm_local(input$player_sel)) %>% slice_head(n = 1)
+    if (nrow(row) == 0) return(NULL)
+    row
+  })
+  
+  output$player_kpi_total_points <- shiny::renderText({
+    row <- player_row_total_f()
+    if (is.null(row)) return("-")
+    format(round(as.numeric(row$total_puntuacion), 1), big.mark = ".", decimal.mark = ",", nsmall = 1)
+  })
+  
+  output$player_kpi_matches <- shiny::renderText({
+    req(input$player_sel)
+    df <- players_total_f() %>% dplyr::filter(jugador == input$player_sel)
+    if (nrow(df) == 0) return("0")
+    val <- df$total_partidos_jugados[1]; if (is.na(val)) val <- 0
+    format(val, big.mark = ".", decimal.mark = ",")
+  })
+  
+  output$player_kpi_winrate <- shiny::renderText({
+    row <- player_row_total_f()
+    if (is.null(row)) return("-")
+    paste0(format(round(as.numeric(row$total_win_rate) * 100, 1), decimal.mark = ","), "%")
+  })
+  
+  output$player_kpi_diff <- shiny::renderText({
+    row <- player_row_total_f()
+    if (is.null(row)) return("-")
+    as.integer(round(as.numeric(row$total_diff), 0))
+  })
+  
+  output$player_kpi_wins <- shiny::renderText({
+    row <- player_row_total_f()
+    if (is.null(row)) return("0")
+    val <- suppressWarnings(as.numeric(row$total_partidos_ganados[1])); if (is.na(val)) val <- 0
+    format(val, big.mark = ".", decimal.mark = ",")
+  })
+  
+  output$plot_player_split <- shiny::renderPlot({
+    req(input$player_sel)
+    plot_player_split_donut(players_total_f(), input$player_sel)
+  })
+  
+  output$plot_player_scatter <- shiny::renderPlot({
+    req(input$player_sel)
+    plot_league_scatter_highlight(players_total_f(), input$player_sel)
+  })
+  
+  # ==========================================================
+  # EVOLUCIÓN: BAR CHART RACE (TODOS) + INSIGHTS TOTAL
+  # ==========================================================
+  rank_race_f <- shiny::reactive({
+    dfj <- players_by_jornada_f()
+    n_all <- nrow(dplyr::distinct(dfj, jugador))
+    make_rank_race_data(dfj, top_n = n_all)
+  })
+  
+  output$race_leader <- shiny::renderText({
+    df <- rank_race_f()
+    if (nrow(df) == 0) return("Líder: -")
+    
+    jmax <- max(df$jornada, na.rm = TRUE)
+    lead <- df %>% dplyr::filter(jornada == jmax, rank == 1) %>% dplyr::slice_head(n = 1)
+    if (nrow(lead) == 0) return("Líder: -")
+    paste0("Líder: ", lead$jugador[1])
+  })
+  
+  output$plot_rank_race <- plotly::renderPlotly({
+    df <- rank_race_f()
+    top_n_real <- if (nrow(df) == 0) 10 else max(df$rank, na.rm = TRUE)
+    p <- plot_rank_race_plotly(df, top_n = top_n_real)
+    plotly::config(p, displayModeBar = FALSE)
+  })
+  
+  swings_total_f <- shiny::reactive({
+    compute_biggest_swings_total(players_by_jornada_f())
+  })
+  
+  output$kpi_best_comeback_total <- shiny::renderText({
+    res <- swings_total_f(); cb <- res$comeback_total
+    if (is.null(cb) || nrow(cb) == 0) return("-")
+    paste0(cb$jugador[1], " (+", as.integer(cb$comeback_delta[1]), " puestos)")
+  })
+  
+  output$kpi_best_comeback_total_detail <- shiny::renderText({
+    res <- swings_total_f(); cb <- res$comeback_total
+    if (is.null(cb) || nrow(cb) == 0) return("-")
+    paste0(
+      "De puesto ", cb$comeback_from_rank[1], " a ", cb$comeback_to_rank[1],
+      " (J", cb$comeback_from_jornada[1], "–J", cb$comeback_to_jornada[1], ")"
+    )
+  })
+  
+  output$kpi_worst_drop_total <- shiny::renderText({
+    res <- swings_total_f(); dr <- res$drop_total
+    if (is.null(dr) || nrow(dr) == 0) return("-")
+    paste0(dr$jugador[1], " (-", as.integer(dr$drop_delta[1]), " puestos)")
+  })
+  
+  output$kpi_worst_drop_total_detail <- shiny::renderText({
+    res <- swings_total_f(); dr <- res$drop_total
+    if (is.null(dr) || nrow(dr) == 0) return("-")
+    paste0(
+      "De puesto ", dr$drop_from_rank[1], " a ", dr$drop_to_rank[1],
+      " (J", dr$drop_from_jornada[1], "–J", dr$drop_to_jornada[1], ")"
+    )
+  })
+  
+  # ==========================================================
+  # SIMULADOR DE PARTIDOS
+  # ==========================================================
+  
+  # Toggle A+ para mostrar/ocultar "tablas técnicas"
+  show_details <- shiny::reactiveVal(FALSE)
+  
+  shiny::observeEvent(input$toggle_details, {
+    show_details(!isTRUE(show_details()))
+  })
+  
+  output$show_details <- shiny::reactive({
+    show_details()
+  })
+  shiny::outputOptions(output, "show_details", suspendWhenHidden = FALSE)
+  
+  output$toggle_details_label <- shiny::renderText({
+    if (isTRUE(show_details())) "Ocultar detalles técnicos" else "Mostrar detalles técnicos"
+  })
+  
+  shiny::observeEvent(players_total_f(), {
+    choices <- players_total_f() %>% dplyr::arrange(jugador) %>% dplyr::pull(jugador)
+    if (length(choices) == 0) return()
+    
+    shiny::updateSelectInput(session, "sim_A1", choices = choices, selected = choices[1])
+    shiny::updateSelectInput(session, "sim_A2", choices = choices, selected = choices[min(2, length(choices))])
+    shiny::updateSelectInput(session, "sim_B1", choices = choices, selected = choices[min(3, length(choices))])
+    shiny::updateSelectInput(session, "sim_B2", choices = choices, selected = choices[min(4, length(choices))])
+  }, ignoreInit = TRUE)
+  
+  sim_res <- shiny::eventReactive(input$sim_run, {
+    req(input$sim_A1, input$sim_A2, input$sim_B1, input$sim_B2)
+    
+    if (key_norm(input$sim_A1) == key_norm(input$sim_A2)) {
+      return(list(error = "La Pareja A no puede tener el mismo jugador dos veces."))
+    }
+    if (key_norm(input$sim_B1) == key_norm(input$sim_B2)) {
+      return(list(error = "La Pareja B no puede tener el mismo jugador dos veces."))
+    }
+    
+    all_keys <- c(key_norm(input$sim_A1), key_norm(input$sim_A2), key_norm(input$sim_B1), key_norm(input$sim_B2))
+    if (length(unique(all_keys)) < 4) {
+      return(list(error = "Un jugador no puede estar en ambas parejas a la vez."))
+    }
+    
+    n_last_val <- if (is.null(input$sim_n_last) || is.na(input$sim_n_last)) 6L else as.integer(input$sim_n_last)
+    
+    out <- predict_match_winner(
+      players_total_df = players_total_f(),
+      matches_df = matches_f(),
+      sat_df = satellites_f(),
+      A1 = input$sim_A1, A2 = input$sim_A2,
+      B1 = input$sim_B1, B2 = input$sim_B2,
+      n_last = n_last_val
+    )
+    
+    out
+  })
+  
+  output$sim_result_text <- shiny::renderText({
+    res <- sim_res()
+    if (is.null(res)) return("Pulsa Simular.")
+    if (!is.null(res$error)) return(res$error)
+    
+    paste0(
+      "Pareja A (", res$pairA, ") vs Pareja B (", res$pairB, ") — ",
+      "P(A gana) = ", format(round(res$pA * 100, 1), decimal.mark = ","), "%."
+    )
+  })
+  
+  output$sim_prob_plot <- shiny::renderPlot({
+    res <- sim_res()
+    if (is.null(res) || !is.null(res$error)) return(ggplot2::ggplot() + ggplot2::theme_void())
+    
+    plot_win_probability(
+      pA = res$pA,
+      labelA = paste0("A: ", res$pairA),
+      labelB = paste0("B: ", res$pairB)
+    )
+  })
+  
+  output$sim_tbl_players <- DT::renderDT({
+    res <- sim_res()
+    if (is.null(res) || !is.null(res$error)) {
+      return(DT::datatable(data.frame()))
+    }
+    
+    df <- res$detail_players %>%
+      dplyr::mutate(
+        total_win_rate = round(total_win_rate * 100, 1),
+        recent_win_rate = round(recent_win_rate * 100, 1),
+        rating = round(rating, 3),
+        diff_por_partido = round(diff_per_match, 3),
+        puntos_por_partido = round(points_per_match, 3),
+        diff_reciente_media = round(recent_diff_mean, 3),
+        experiencia_01 = round(exp_scaled, 3)
+      ) %>%
+      dplyr::select(
+        role, jugador,
+        total_win_rate, diff_por_partido, puntos_por_partido,
+        recent_matches, recent_win_rate, diff_reciente_media,
+        experiencia_01, rating
+      ) %>%
+      dplyr::rename(
+        rol = role,
+        win_rate_total_pct = total_win_rate,
+        partidos_recientes = recent_matches,
+        win_rate_reciente_pct = recent_win_rate
+      )
+    
+    DT::datatable(df, options = list(pageLength = 10, scrollX = TRUE), class = "nowrap")
+  })
+  
+  output$sim_tbl_pairs <- DT::renderDT({
+    res <- sim_res()
+    if (is.null(res) || !is.null(res$error)) {
+      return(DT::datatable(data.frame()))
+    }
+    
+    df <- res$detail_pairs %>%
+      dplyr::mutate(
+        synergy_win_rate = ifelse(is.na(synergy_win_rate), NA, round(synergy_win_rate * 100, 1)),
+        base_rating = round(base_rating, 3),
+        synergy_bonus = round(synergy_bonus, 3),
+        final_rating = round(final_rating, 3)
+      ) %>%
+      dplyr::rename(
+        lado = side,
+        pareja = pareja,
+        rating_base = base_rating,
+        bonus_sinergia = synergy_bonus,
+        rating_final = final_rating,
+        partidos_juntos = synergy_matches,
+        win_rate_pareja_pct = synergy_win_rate
+      )
+    
+    DT::datatable(df, options = list(pageLength = 5, scrollX = TRUE), class = "nowrap")
+  })
+  
+  # Monte Carlo scorelines (juego a juego)
+  score_mc <- shiny::reactive({
+    res <- sim_res()
+    if (is.null(res) || !is.null(res$error)) return(NULL)
+    
+    simulate_scorelines_game_by_game(
+      p_match_A = res$pA,
+      n_sims = 12000,
+      max_games = 6
+    )
+  })
+  
+  output$sim_tbl_scores <- DT::renderDT({
+    sc <- score_mc()
+    if (is.null(sc)) return(DT::datatable(data.frame()))
+    
+    df <- sc$table %>%
+      dplyr::mutate(prob_pct = round(prob * 100, 2)) %>%
+      dplyr::select(marcador = score, prob_pct)
+    
+    DT::datatable(df, options = list(pageLength = 6, dom = "t"), rownames = FALSE)
+  })
+}
+
+############################################################################
+# R/app_ui.R
+
+library(shiny)
+library(DT)
+library(plotly)
+
+app_ui <- function() {
+  shiny::fluidPage(
+    shiny::titlePanel("TFG Pádel - Dashboard"),
+    
+    # ---- Styles ----
+    shiny::tags$head(
+      shiny::tags$style(shiny::HTML("
+        body { background: #ffffff; }
+
+        .kpi-card {
+          background: linear-gradient(180deg, #ffffff 0%, #f9fbfa 100%);
+          border: 1px solid #e6ece8;
+          border-left: 6px solid #2E7D32;
+          border-radius: 16px;
+          padding: 18px;
+          box-shadow: 0 6px 18px rgba(0,0,0,0.06);
+          height: 110px;
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          margin-bottom: 12px;
+          transition: all 0.2s ease;
+        }
+        .kpi-card:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 10px 22px rgba(0,0,0,0.08);
+        }
+
+        .kpi-label {
+          font-size: 12px;
+          color: #495057;
+          margin-bottom: 6px;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          font-weight: 800;
+        }
+        .kpi-value {
+          font-size: 22px;
+          font-weight: 800;
+          color: #212121;
+          line-height: 1.15;
+        }
+        .kpi-sub {
+          font-size: 12px;
+          color: #6c757d;
+          margin-top: 6px;
+          font-weight: 600;
+        }
+
+        .box {
+          background: #fff;
+          border: 1px solid #e9ecef;
+          border-radius: 16px;
+          padding: 16px 18px;
+          box-shadow: 0 6px 18px rgba(0,0,0,0.05);
+          margin-bottom: 14px;
+        }
+
+        /* --- Filter card (selector jugador) --- */
+        .filter-card{
+          background: linear-gradient(180deg, rgba(46,125,50,0.10) 0%, rgba(255,255,255,1) 55%);
+          border: 1px solid #dfe7e2;
+          border-top: 4px solid #2E7D32;
+          border-radius: 16px;
+          padding: 14px 16px;
+          box-shadow: 0 8px 20px rgba(0,0,0,0.06);
+          margin-bottom: 12px;
+        }
+
+        .filter-title{
+          font-size: 12px;
+          font-weight: 900;
+          color: #1B5E20;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          margin-bottom: 8px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .filter-card .form-control{
+          height: 44px;
+          border-radius: 12px;
+          border: 1px solid #cfd8d3;
+          font-weight: 700;
+        }
+
+        .filter-card .form-control:focus{
+          border-color: #2E7D32;
+          box-shadow: 0 0 0 0.2rem rgba(46,125,50,0.18);
+        }
+
+        /* Evolución (bar race) */
+        .race-sub{
+          color: #6c757d;
+          font-size: 12px;
+          font-weight: 600;
+          margin-bottom: 6px;
+        }
+        .leader-box{
+          font-size: 20px;
+          font-weight: 900;
+          color: #1B5E20;
+          margin-bottom: 10px;
+        }
+        .race-foot{
+          text-align: center;
+          font-size: 12px;
+          color: #6c757d;
+          font-weight: 600;
+          margin-top: 6px;
+        }
+
+        /* Toggle detalles técnicos */
+        a#toggle_details {
+          font-weight: 800;
+          color: #1B5E20;
+          text-decoration: none;
+        }
+        a#toggle_details:hover {
+          text-decoration: underline;
+        }
+      "))
+    ),
+    
+    # ---- Global filters ----
+    shiny::fluidRow(
+      shiny::column(
+        width = 4,
+        shiny::selectInput("season", "Temporada", choices = NULL, selected = NULL)
+      ),
+      shiny::column(
+        width = 4,
+        shiny::selectInput("trimestre", "Trimestre", choices = NULL, selected = "__ALL__")
+      ),
+      shiny::column(
+        width = 4,
+        shiny::selectInput(
+          "jornada",
+          "Jornada (filtra tablas y ranking)",
+          choices = NULL,
+          selected = "__ALL__"
+        )
+      )
+    ),
+    
+    shiny::tabsetPanel(
+      
+      # ==========================================================
+      # RESUMEN
+      # ==========================================================
+      shiny::tabPanel(
+        "Resumen",
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 3,
+            shiny::div(class = "box",
+                       shiny::selectInput(
+                         "top_n",
+                         "Top N",
+                         choices = c(5, 10, 15, 20),
+                         selected = 10
+                       )
+            )
+          ),
+          shiny::column(
+            width = 3,
+            shiny::div(
+              class = "kpi-card",
+              shiny::div(class = "kpi-label", "PARTICIPANTES"),
+              shiny::div(class = "kpi-value",
+                         shiny::textOutput("kpi_players_unique", inline = TRUE)
+              )
+            )
+          ),
+          shiny::column(
+            width = 3,
+            shiny::div(
+              class = "kpi-card",
+              shiny::div(class = "kpi-label", "MÁXIMA PUNTUACIÓN"),
+              shiny::div(class = "kpi-value",
+                         shiny::textOutput("kpi_max_points", inline = TRUE)
+              )
+            )
+          ),
+          shiny::column(
+            width = 3,
+            shiny::div(
+              class = "kpi-card",
+              shiny::div(class = "kpi-label", "GANADOR"),
+              shiny::div(class = "kpi-value",
+                         shiny::textOutput("kpi_top_player", inline = TRUE)
+              )
+            )
+          )
+        ),
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 12,
+            shiny::div(class = "box",
+                       shiny::h4("Ranking por puntuación total"),
+                       shiny::plotOutput("plot_top_total", height = "520px")
+            )
+          )
+        )
+      ),
+      
+      # ==========================================================
+      # EVOLUCIÓN (Bar Chart Race + KPIs)
+      # ==========================================================
+      shiny::tabPanel(
+        "Evolución",
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 12,
+            shiny::div(class = "box",
+                       
+                       shiny::div(class = "race-sub",
+                                  "Pulsa Play para ver el ranking acumulado evolucionar por jornada (todos los jugadores)."
+                       ),
+                       
+                       shiny::div(class = "leader-box",
+                                  shiny::textOutput("race_leader", inline = TRUE)
+                       ),
+                       
+                       shiny::fluidRow(
+                         shiny::column(
+                           width = 6,
+                           shiny::div(class = "kpi-card",
+                                      shiny::div(class = "kpi-label", "REMONTADA TOTAL"),
+                                      shiny::div(class = "kpi-value",
+                                                 shiny::textOutput("kpi_best_comeback_total", inline = TRUE)
+                                      ),
+                                      shiny::div(class = "kpi-sub",
+                                                 shiny::textOutput("kpi_best_comeback_total_detail", inline = TRUE)
+                                      )
+                           )
+                         ),
+                         shiny::column(
+                           width = 6,
+                           shiny::div(class = "kpi-card",
+                                      shiny::div(class = "kpi-label", "CAÍDA TOTAL"),
+                                      shiny::div(class = "kpi-value",
+                                                 shiny::textOutput("kpi_worst_drop_total", inline = TRUE)
+                                      ),
+                                      shiny::div(class = "kpi-sub",
+                                                 shiny::textOutput("kpi_worst_drop_total_detail", inline = TRUE)
+                                      )
+                           )
+                         )
+                       ),
+                       
+                       plotly::plotlyOutput("plot_rank_race", height = "620px"),
+                       shiny::div(class = "race-foot", "Ranking acumulado por jornada (Cuadro + Satélite)")
+            )
+          )
+        )
+      ),
+      
+      # ==========================================================
+      # JUGADOR
+      # ==========================================================
+      shiny::tabPanel(
+        "Jugador",
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 4,
+            
+            shiny::fluidRow(
+              shiny::column(
+                width = 6,
+                shiny::div(class = "filter-card",
+                           shiny::div(class = "filter-title", "Jugador"),
+                           shiny::selectInput(
+                             "player_sel",
+                             label = NULL,
+                             choices = NULL,
+                             selected = NULL
+                           )
+                )
+              ),
+              shiny::column(
+                width = 6,
+                shiny::div(class = "kpi-card",
+                           shiny::div(class = "kpi-label", "PARTIDOS GANADOS"),
+                           shiny::div(class = "kpi-value",
+                                      shiny::textOutput("player_kpi_wins", inline = TRUE)
+                           ),
+                           shiny::div(class = "kpi-sub", "Cuadro + Satélite")
+                )
+              )
+            ),
+            
+            shiny::fluidRow(
+              shiny::column(
+                width = 6,
+                shiny::div(class = "kpi-card",
+                           shiny::div(class = "kpi-label", "PUNTOS TOTALES"),
+                           shiny::div(class = "kpi-value",
+                                      shiny::textOutput("player_kpi_total_points", inline = TRUE)
+                           )
+                )
+              ),
+              shiny::column(
+                width = 6,
+                shiny::div(class = "kpi-card",
+                           shiny::div(class = "kpi-label", "PARTIDOS JUGADOS"),
+                           shiny::div(class = "kpi-value",
+                                      shiny::textOutput("player_kpi_matches", inline = TRUE)
+                           ),
+                           shiny::div(class = "kpi-sub", "Cuadro + Satélite")
+                )
+              )
+            ),
+            
+            shiny::fluidRow(
+              shiny::column(
+                width = 6,
+                shiny::div(class = "kpi-card",
+                           shiny::div(class = "kpi-label", "% VICTORIAS"),
+                           shiny::div(class = "kpi-value",
+                                      shiny::textOutput("player_kpi_winrate", inline = TRUE)
+                           )
+                )
+              ),
+              shiny::column(
+                width = 6,
+                shiny::div(class = "kpi-card",
+                           shiny::div(class = "kpi-label", "DIFERENCIA"),
+                           shiny::div(class = "kpi-value",
+                                      shiny::textOutput("player_kpi_diff", inline = TRUE)
+                           ),
+                           shiny::div(class = "kpi-sub", "Juegos (ganados - perdidos)")
+                )
+              )
+            ),
+            
+            shiny::div(class = "box",
+                       shiny::h4("Cuadro vs Satélite"),
+                       shiny::plotOutput("plot_player_split", height = "200px")
+            )
+          ),
+          
+          shiny::column(
+            width = 8,
+            
+            shiny::div(class = "box",
+                       shiny::h4("Evolución: puntos por jornada"),
+                       shiny::plotOutput("plot_player_evolution", height = "220px")
+            ),
+            
+            shiny::div(class = "box",
+                       shiny::h4("Comparativa en liga"),
+                       shiny::plotOutput("plot_player_scatter", height = "220px")
+            )
+          )
+        )
+      ),
+      
+      # ==========================================================
+      # SIMULADOR
+      # ==========================================================
+      shiny::tabPanel(
+        "Simulador",
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 12,
+            shiny::div(class = "box",
+                       shiny::h4("Simulador de partido (predicción de ganador)"),
+                       shiny::p("Selecciona 2 jugadores por pareja. El modelo usa rendimiento global, forma reciente y sinergia histórica de la pareja.")
+            )
+          )
+        ),
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 6,
+            shiny::div(class = "box",
+                       shiny::h4("Pareja A"),
+                       shiny::selectInput("sim_A1", "Jugador A1", choices = NULL),
+                       shiny::selectInput("sim_A2", "Jugador A2", choices = NULL)
+            )
+          ),
+          shiny::column(
+            width = 6,
+            shiny::div(class = "box",
+                       shiny::h4("Pareja B"),
+                       shiny::selectInput("sim_B1", "Jugador B1", choices = NULL),
+                       shiny::selectInput("sim_B2", "Jugador B2", choices = NULL)
+            )
+          )
+        ),
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 4,
+            shiny::div(class = "box",
+                       shiny::sliderInput("sim_n_last", "Forma reciente (últimos partidos)", min = 2, max = 20, value = 6, step = 1),
+                       shiny::actionButton("sim_run", "Simular", class = "btn-success")
+            )
+          ),
+          shiny::column(
+            width = 8,
+            shiny::div(class = "box",
+                       shiny::h4("Resultado"),
+                       shiny::textOutput("sim_result_text"),
+                       shiny::plotOutput("sim_prob_plot", height = "280px")
+            )
+          )
+        ),
+        
+        shiny::fluidRow(
+          shiny::column(
+            width = 12,
+            shiny::div(class = "box",
+                       shiny::h4("Marcadores más probables (Monte Carlo)"),
+                       DT::DTOutput("sim_tbl_scores")
+            )
+          )
+        ),
+        
+        # ---- A+ Toggle: ocultar/mostrar tablas técnicas ----
+        shiny::fluidRow(
+          shiny::column(
+            width = 12,
+            shiny::div(
+              class = "box",
+              shiny::actionLink("toggle_details",
+                                shiny::textOutput("toggle_details_label", inline = TRUE))
+            )
+          )
+        ),
+        
+        shiny::conditionalPanel(
+          condition = "output.show_details === true",
+          shiny::fluidRow(
+            shiny::column(
+              width = 6,
+              shiny::div(class = "box",
+                         shiny::h4("Detalle por jugador"),
+                         DT::DTOutput("sim_tbl_players")
+              )
+            ),
+            shiny::column(
+              width = 6,
+              shiny::div(class = "box",
+                         shiny::h4("Detalle por pareja (sinergia)"),
+                         DT::DTOutput("sim_tbl_pairs")
+              )
+            )
+          )
+        )
+      ),
+      
+      # ==========================================================
+      # DATOS / DEBUG
+      # ==========================================================
+      shiny::tabPanel("Calendario", DT::DTOutput("tbl_calendar")),
+      shiny::tabPanel("Tesorería", DT::DTOutput("tbl_finance")),
+      shiny::tabPanel("Jornadas (debug)", DT::DTOutput("tbl_matches")),
+      shiny::tabPanel("Jugadores (debug)", DT::DTOutput("tbl_players")),
+      shiny::tabPanel("Satélites (debug)", DT::DTOutput("tbl_satellites")),
+      shiny::tabPanel("Jugadores Satélites (debug)", DT::DTOutput("tbl_players_sat")),
+      shiny::tabPanel("Jugadores TOTAL", DT::DTOutput("tbl_players_total"))
+    )
+  )
+}
+
+#################################################3
+# R/functions_plot.R
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(stringi)
+library(tibble)
+library(plotly)
+
+# -----------------------------
+# Top N jugadores (Ranking)
+# -----------------------------
+plot_top_players_total <- function(df, n = 10) {
+  df <- df %>%
+    mutate(
+      jugador = as.character(jugador),
+      total_puntuacion = as.numeric(total_puntuacion)
+    ) %>%
+    filter(!is.na(total_puntuacion), jugador != "")
+  
+  top <- df %>%
+    arrange(desc(total_puntuacion)) %>%
+    slice_head(n = n) %>%
+    mutate(
+      jugador = factor(jugador, levels = rev(jugador)),
+      label_pts = format(round(total_puntuacion, 1),
+                         big.mark = ".", decimal.mark = ",", nsmall = 1
+      )
+    )
+  
+  ggplot(top, aes(x = jugador, y = total_puntuacion)) +
+    geom_col(fill = "#2E7D32", width = 0.7) +
+    geom_text(aes(label = label_pts), hjust = -0.1, size = 4, fontface = "bold") +
+    coord_flip(clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(size = 12, face = "bold"),
+      axis.text.x = element_text(size = 11),
+      plot.margin = grid::unit(c(10, 50, 10, 10), "pt")
+    )
+}
+
+# -----------------------------
+# Evolución puntos por jornada (NO acumulado)
+# -----------------------------
+plot_player_evolution <- function(df_by_jornada, player_name) {
+  
+  key_norm <- function(x) {
+    x <- as.character(x)
+    x <- stringi::stri_trans_general(x, "Latin-ASCII")
+    x <- toupper(x)
+    stringr::str_squish(x)
+  }
+  
+  df <- df_by_jornada %>%
+    mutate(
+      jugador = as.character(jugador),
+      jugador_key = key_norm(jugador),
+      jornada = as.integer(jornada),
+      puntos_jornada = as.numeric(puntuacion_total)
+    ) %>%
+    filter(!is.na(jornada), !is.na(jugador), jugador != "")
+  
+  if (nrow(df) == 0 || is.null(player_name) || player_name == "") {
+    return(ggplot() + theme_void() + labs(title = "No hay datos para mostrar"))
+  }
+  
+  pdat <- df %>%
+    filter(jugador_key == key_norm(player_name)) %>%
+    arrange(jornada)
+  
+  if (nrow(pdat) == 0) {
+    return(ggplot() + theme_void() + labs(title = "Sin datos con este filtro"))
+  }
+  
+  player_label <- pdat$jugador[1]
+  
+  pdat <- pdat %>%
+    mutate(label_pts = format(round(puntos_jornada, 1),
+                              big.mark = ".", decimal.mark = ",", nsmall = 1
+    ))
+  
+  ggplot(pdat, aes(x = jornada, y = puntos_jornada)) +
+    geom_line(linewidth = 1.2, color = "#2E7D32") +
+    geom_point(size = 2.6, color = "#2E7D32") +
+    geom_text(aes(label = label_pts), vjust = -1.0, size = 4, fontface = "bold") +
+    scale_x_continuous(breaks = sort(unique(pdat$jornada))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20))) +
+    labs(
+      title = player_label,
+      x = "Jornada",
+      y = ""
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+# -----------------------------
+# Donut: Cuadro vs Satélite
+# -----------------------------
+plot_player_split_donut <- function(players_total_df, player_name) {
+  
+  key_norm <- function(x) {
+    x <- as.character(x)
+    x <- stringi::stri_trans_general(x, "Latin-ASCII")
+    x <- toupper(x)
+    stringr::str_squish(x)
+  }
+  
+  get_num_col <- function(df, candidates) {
+    nm <- intersect(candidates, names(df))
+    if (length(nm) == 0) return(rep(0, nrow(df)))
+    x <- df[[nm[1]]]
+    x <- suppressWarnings(as.numeric(x))
+    dplyr::coalesce(x, 0)
+  }
+  
+  fmt_num <- function(x) {
+    format(round(x, 1), big.mark = ".", decimal.mark = ",", nsmall = 1)
+  }
+  
+  df <- players_total_df %>%
+    mutate(
+      jugador = as.character(jugador),
+      jugador_key = key_norm(jugador)
+    )
+  
+  row <- df %>%
+    filter(jugador_key == key_norm(player_name)) %>%
+    slice_head(n = 1)
+  
+  if (nrow(row) == 0) {
+    return(ggplot() + theme_void() + labs(title = "Origen de puntos"))
+  }
+  
+  a <- get_num_col(row, c("cuadro_puntuacion"))[1]
+  b <- get_num_col(row, c("sat_puntuacion_satelite"))[1]
+  
+  tot <- get_num_col(row, c("total_puntuacion"))[1]
+  if ((a + b) == 0 && tot > 0) b <- tot
+  
+  if ((a + b) == 0) {
+    return(ggplot() + theme_void() + labs(title = "Origen de puntos"))
+  }
+  
+  plot_df <- tibble(
+    tipo = c("Cuadro", "Satélite"),
+    puntos = c(a, b)
+  ) %>%
+    mutate(
+      pct = puntos / sum(puntos),
+      label = ifelse(puntos <= 0, "", paste0(fmt_num(puntos), " (", round(pct * 100, 0), "%)"))
+    )
+  
+  ggplot(plot_df, aes(x = 2, y = puntos, fill = tipo)) +
+    geom_col(width = 1, color = "white") +
+    coord_polar(theta = "y") +
+    xlim(0.5, 2.5) +
+    geom_text(aes(label = label),
+              position = position_stack(vjust = 0.5),
+              size = 4,
+              fontface = "bold"
+    ) +
+    theme_void(base_size = 12) +
+    labs(title = "Origen de puntos", fill = NULL) +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.text = element_text(size = 12, face = "bold"),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+# -----------------------------
+# Scatter liga: win_rate vs diff (resalta jugador)
+# -----------------------------
+plot_league_scatter_highlight <- function(players_total_df, player_name) {
+  
+  key_norm <- function(x) {
+    x <- as.character(x)
+    x <- stringi::stri_trans_general(x, "Latin-ASCII")
+    x <- toupper(x)
+    stringr::str_squish(x)
+  }
+  
+  df <- players_total_df %>%
+    mutate(
+      jugador = as.character(jugador),
+      jugador_key = key_norm(jugador),
+      total_win_rate = suppressWarnings(as.numeric(total_win_rate)),
+      total_diff = suppressWarnings(as.numeric(total_diff)),
+      total_partidos_jugados = suppressWarnings(as.numeric(total_partidos_jugados))
+    ) %>%
+    filter(!is.na(total_win_rate), !is.na(total_diff), jugador != "")
+  
+  if (nrow(df) == 0) return(ggplot() + theme_void() + labs(title = "Sin datos"))
+  
+  df <- df %>% mutate(is_sel = jugador_key == key_norm(player_name))
+  
+  ggplot(df, aes(x = total_win_rate, y = total_diff)) +
+    geom_point(aes(size = total_partidos_jugados),
+               alpha = 0.22, color = "#81C784"
+    ) +
+    geom_point(data = df %>% filter(is_sel),
+               size = 5, color = "#2E7D32"
+    ) +
+    scale_x_continuous(labels = function(x) paste0(round(x * 100, 0), "%")) +
+    labs(
+      x = "% victorias",
+      y = "Diferencia total (juegos)"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(panel.grid.minor = element_blank()) +
+    guides(size = "none")
+}
+
+# -----------------------------
+# Bar Chart Race (Plotly) - PREMIUM
+# df debe traer: jornada, jugador, puntos_acum, rank, y_rank, color, label_out
+# -----------------------------
+plot_rank_race_plotly <- function(rank_race_df, top_n = 10) {
+  
+  if (nrow(rank_race_df) == 0) {
+    return(plotly::plot_ly() %>% plotly::layout(title = "Sin datos"))
+  }
+  
+  top_n <- as.integer(top_n)
+  
+  # ---- Paleta automática (estable) por jugador ----
+  players <- sort(unique(rank_race_df$jugador))
+  ncol <- length(players)
+  pal <- grDevices::hcl.colors(n = max(ncol, 3), palette = "Dark 3")
+  names(pal) <- players
+  
+  # ---- Aire para texto fuera ----
+  xmax <- max(rank_race_df$puntos_acum, na.rm = TRUE)
+  if (!is.finite(xmax)) xmax <- 0
+  xmax_pad <- xmax * 1.15 + 0.01
+  
+  plotly::plot_ly(
+    data = rank_race_df,
+    x = ~puntos_acum,
+    y = ~y_rank,
+    frame = ~jornada,
+    ids = ~jugador,              # ✅ mantiene identidad entre frames
+    type = "bar",
+    orientation = "h",
+    
+    # ✅ colores automáticos por jugador
+    color = ~jugador,
+    colors = pal,
+    
+    # ✅ texto fuera (nombre + puntos) sin cortes
+    text = ~label_out,
+    textposition = "outside",
+    cliponaxis = FALSE,
+    constraintext = "none",
+    
+    customdata = ~jugador,
+    hovertemplate = paste(
+      "<b>Posición:</b> %{y}<br>",
+      "<b>Jugador:</b> %{customdata}<br>",
+      "<b>Jornada:</b> %{frame}<br>",
+      "<b>Puntos acumulados:</b> %{x:.1f}<extra></extra>"
+    )
+  ) %>%
+    plotly::layout(
+      paper_bgcolor = "#ffffff",
+      plot_bgcolor  = "#f8faf9",
+      font = list(family = "Arial", size = 14),
+      
+      xaxis = list(
+        title = "Puntos acumulados",
+        range = c(0, xmax_pad),
+        showgrid = FALSE,
+        zeroline = FALSE,
+        fixedrange = TRUE
+      ),
+      
+      yaxis = list(
+        title = "",
+        autorange = "reversed",          # 1 arriba
+        tickmode = "array",
+        tickvals = 1:top_n,
+        ticktext = sprintf("%02d", 1:top_n),
+        range = c(top_n + 0.5, 0.5),
+        fixedrange = TRUE
+      ),
+      
+      margin = list(l = 60, r = 220, t = 10, b = 40),
+      showlegend = FALSE
+    ) %>%
+    # ✅ animación más fluida (menos tirones)
+    plotly::animation_opts(
+      frame = 1600,
+      transition = 1600,
+      easing = "linear",
+      redraw = FALSE
+    ) %>%
+    plotly::animation_slider(
+      currentvalue = list(prefix = "Jornada: ", font = list(size = 16))
+    ) %>%
+    plotly::animation_button(
+      x = 1, xanchor = "right", y = 0, yanchor = "bottom"
+    )
+}
+
+##########################################3
+# -----------------------------
+# Probabilidad victoria (barra simple)
+# -----------------------------
+plot_win_probability <- function(pA, labelA = "Pareja A", labelB = "Pareja B") {
+  df <- tibble::tibble(
+    pareja = c(labelA, labelB),
+    prob = c(pA, 1 - pA)
+  )
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = pareja, y = prob)) +
+    ggplot2::geom_col(fill = "#2E7D32", width = 0.6) +
+    ggplot2::geom_text(ggplot2::aes(label = paste0(round(prob * 100, 1), "%")),
+                       vjust = -0.3, fontface = "bold", size = 5) +
+    ggplot2::scale_y_continuous(limits = c(0, 1.05), labels = function(x) paste0(round(x*100,0), "%")) +
+    ggplot2::labs(x = NULL, y = "Probabilidad de victoria") +
+    ggplot2::theme_minimal(base_size = 14) +
+    ggplot2::theme(panel.grid.minor = ggplot2::element_blank(),
+                   axis.text.x = ggplot2::element_text(face = "bold"))
+}
+
+
+
+# ==========================================================
+# MONTE CARLO juego-a-juego (set a 6, sin tie-break)
+# - Simula juegos con probabilidad p_game
+# - Convierte p_match -> p_game por bisección usando DP
+# ==========================================================
+
+# Prob de que A gane un set a 6 si gana cada juego con prob p
+p_set6_from_pgame <- function(p_game, max_games = 6) {
+  dp <- matrix(0, nrow = max_games + 1, ncol = max_games + 1)
+  dp[1, 1] <- 1
+  
+  for (a in 0:max_games) {
+    for (b in 0:max_games) {
+      prob <- dp[a + 1, b + 1]
+      if (prob == 0) next
+      if (a == max_games || b == max_games) next
+      
+      dp[a + 2, b + 1] <- dp[a + 2, b + 1] + prob * p_game
+      dp[a + 1, b + 2] <- dp[a + 1, b + 2] + prob * (1 - p_game)
+    }
+  }
+  
+  # Estados finales donde A llega a 6 y B está en 0..5
+  sum(dp[max_games + 1, 1:max_games])
+}
+
+# Convierte P(partido) -> p_game (aprox numérica)
+p_game_from_pmatch <- function(p_match, max_games = 6, tol = 1e-4) {
+  p_match <- max(min(as.numeric(p_match), 0.999), 0.001)
+  
+  lo <- 0.01; hi <- 0.99
+  for (i in 1:45) {
+    mid <- (lo + hi) / 2
+    pmid <- p_set6_from_pgame(mid, max_games = max_games)
+    if (abs(pmid - p_match) < tol) return(mid)
+    if (pmid < p_match) lo <- mid else hi <- mid
+  }
+  (lo + hi) / 2
+}
+
+# Simula un set (a 6 juegos)
+simulate_set_once <- function(p_game, max_games = 6) {
+  a <- 0L; b <- 0L
+  while (a < max_games && b < max_games) {
+    if (runif(1) < p_game) a <- a + 1L else b <- b + 1L
+  }
+  c(a = a, b = b)
+}
+
+# Simulación Monte Carlo de marcadores
+simulate_scorelines_game_by_game <- function(p_match_A, n_sims = 10000, max_games = 6) {
+  p_match_A <- max(min(as.numeric(p_match_A), 0.999), 0.001)
+  
+  # Si A no es favorito, simulamos desde el favorito y luego invertimos marcador
+  flip <- p_match_A < 0.5
+  pW <- if (flip) 1 - p_match_A else p_match_A
+  
+  p_game <- p_game_from_pmatch(pW, max_games = max_games)
+  
+  scores <- character(n_sims)
+  for (i in seq_len(n_sims)) {
+    s <- simulate_set_once(p_game, max_games = max_games)
+    if (!flip) {
+      scores[i] <- paste0(s["a"], "-", s["b"])
+    } else {
+      scores[i] <- paste0(s["b"], "-", s["a"])
+    }
+  }
+  
+  df <- dplyr::count(tibble::tibble(score = scores), score, name = "n") %>%
+    dplyr::mutate(prob = n / sum(n)) %>%
+    dplyr::arrange(dplyr::desc(prob))
+  
+  list(p_game = p_game, table = df)
+}
+
+# ----------------------------------------------------------
+# Plot top marcadores (barra)
+# ----------------------------------------------------------
+plot_top_scorelines <- function(score_df, top_k = 6) {
+  df <- score_df %>%
+    dplyr::slice_head(n = top_k) %>%
+    dplyr::mutate(score = factor(score, levels = rev(score)))
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = score, y = prob)) +
+    ggplot2::geom_col(fill = "#2E7D32", width = 0.7) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = paste0(round(prob * 100, 1), "%")),
+      hjust = -0.1, fontface = "bold", size = 4
+    ) +
+    ggplot2::coord_flip(clip = "off") +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.18))) +
+    ggplot2::labs(x = NULL, y = "Probabilidad (Monte Carlo)") +
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(panel.grid.minor = ggplot2::element_blank())
+}
+
+
+#######################################################
+# R/functions_data.R
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(stringi)
+library(tibble)
+library(purrr)
+
+# ----------------------------
+# Diccionario: alias -> nombre corto (CANÓNICO)
+# ----------------------------
+player_alias <- c(
+  "Sanjur"  = "David S",
+  "Lisbel" = "Lisbel V",
+  "Adri" = "Adri L",
+  "Tito M" = "Rubén D",
+  "Golden" = "Rubén D",
+  "DJ" = "David J",
+  "Alfon"= "Alfon R",
+  "Ace" = "Victor A",
+  "Mora" = "Alejandro M",
+  "Anés" = "Rubén A",
+  "Astu" = "Rubén D",
+  "Tito" = "Antonio M",
+  "Loren" = "Rubén R",
+  "Canario" = "Jonatan A",
+  "Torbe" = "Francisco J",
+  "Cami"= "Camilo G",
+  "Alarcón" = "Javier A",
+  "Cate"= "Alegandro C",
+  "Fonsy"= "Alberto F",
+  "Funci" = "David L",
+  "Quero" = "Óscar Q"
+)
+
+# ----------------------------
+# Normalización de nombres
+# ----------------------------
+normalize_player_name <- function(x) {
+  x <- as.character(x)
+  
+  x <- stringr::str_replace_all(x, "\u00a0", " ")
+  x <- stringr::str_squish(x)
+  x <- stringr::str_replace_all(x, "\\.+", "")
+  x <- stringr::str_replace_all(x, "\\s+", " ")
+  
+  key <- stringr::str_to_lower(x)
+  alias_key <- stringr::str_to_lower(stringr::str_squish(names(player_alias)))
+  idx <- match(key, alias_key)
+  hit <- !is.na(idx)
+  x[hit] <- as.character(player_alias[idx[hit]])
+  
+  x <- stringr::str_replace(
+    x,
+    "^([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)\\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]).*$",
+    "\\1 \\2"
+  )
+  
+  x
+}
+
+# ----------------------------
+# Fix leaked initials
+# ----------------------------
+fix_leaked_initials_row <- function(pareja_a, pareja_b) {
+  
+  norm_sep <- function(x) {
+    x <- as.character(x)
+    x <- stringr::str_squish(x)
+    x <- stringr::str_replace_all(x, "[–—−]", "-")
+    x <- stringr::str_replace_all(x, "\\s*-\\s*", " - ")
+    x
+  }
+  
+  pareja_a <- norm_sep(pareja_a)
+  pareja_b <- norm_sep(pareja_b)
+  
+  if (is.na(pareja_a) || is.na(pareja_b) || pareja_a == "" || pareja_b == "") {
+    return(tibble::tibble(pareja_a = pareja_a, pareja_b = pareja_b))
+  }
+  
+  a_parts <- stringr::str_split_fixed(pareja_a, " - ", 2)
+  b_parts <- stringr::str_split_fixed(pareja_b, " - ", 2)
+  
+  a1 <- stringr::str_squish(a_parts[, 1])
+  a2 <- stringr::str_squish(a_parts[, 2])
+  b1 <- stringr::str_squish(b_parts[, 1])
+  b2 <- stringr::str_squish(b_parts[, 2])
+  
+  m <- stringr::str_match(b1, "^([A-Za-z])\\s+(.+)$")
+  
+  if (!is.na(m[1, 1])) {
+    ini <- m[1, 2]
+    rest_b1 <- m[1, 3]
+    
+    a2_words <- stringr::str_count(a2, "\\S+")
+    a2_has_trailing_initial <- stringr::str_detect(a2, "\\b[A-Za-z]$")
+    
+    if (a2_words == 1 && !a2_has_trailing_initial) {
+      a2 <- paste(a2, ini)
+      b1 <- rest_b1
+    }
+  }
+  
+  tibble::tibble(
+    pareja_a = stringr::str_squish(paste(a1, a2, sep = " - ")),
+    pareja_b = stringr::str_squish(paste(b1, b2, sep = " - "))
+  )
+}
+
+# ----------------------------
+# Tabla jugador individual (cuadro)
+# ----------------------------
+make_player_stats <- function(matches_df) {
+  
+  pairs_long <- matches_df %>%
+    dplyr::mutate(
+      pareja_a = stringr::str_squish(pareja_a),
+      pareja_b = stringr::str_squish(pareja_b)
+    ) %>%
+    dplyr::filter(
+      !is.na(puntos_a), !is.na(puntos_b),
+      pareja_a != "", pareja_b != ""
+    ) %>%
+    dplyr::transmute(
+      season, jornada,
+      pareja_a, pareja_b,
+      puntos_a = as.numeric(puntos_a),
+      puntos_b = as.numeric(puntos_b)
+    ) %>%
+    tidyr::pivot_longer(
+      cols = c(pareja_a, pareja_b),
+      names_to = "lado",
+      values_to = "pareja"
+    ) %>%
+    dplyr::mutate(
+      games_for     = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+      games_against = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+      win = games_for > games_against
+    ) %>%
+    dplyr::select(season, jornada, pareja, games_for, games_against, win)
+  
+  pair_jornada <- pairs_long %>%
+    dplyr::group_by(season, jornada, pareja) %>%
+    dplyr::summarise(
+      partidos_jugados = dplyr::n(),
+      partidos_ganados = sum(win),
+      partidos_perdidos = partidos_jugados - partidos_ganados,
+      games_for = sum(games_for, na.rm = TRUE),
+      games_against = sum(games_against, na.rm = TRUE),
+      diff = games_for - games_against,
+      .groups = "drop"
+    )
+  
+  bonus_from_rank <- function(r) {
+    dplyr::case_when(
+      r == 1 ~ 3.0,
+      r == 2 ~ 2.5,
+      r == 3 ~ 2.0,
+      r == 4 ~ 1.5,
+      r == 5 ~ 1.0,
+      r == 6 ~ 0.5,
+      TRUE ~ 0.0
+    )
+  }
+  
+  pair_jornada <- pair_jornada %>%
+    dplyr::group_by(season, jornada) %>%
+    dplyr::mutate(
+      rank_group = dplyr::dense_rank(dplyr::desc(diff)),
+      bonus_average = bonus_from_rank(rank_group),
+      puntuacion = partidos_ganados + bonus_average
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-rank_group)
+  
+  players_long <- pair_jornada %>%
+    tidyr::separate(pareja, into = c("j1", "j2"), sep = "-", fill = "right") %>%
+    dplyr::mutate(
+      j1 = normalize_player_name(stringr::str_squish(j1)),
+      j2 = normalize_player_name(stringr::str_squish(j2))
+    ) %>%
+    tidyr::pivot_longer(
+      cols = c(j1, j2),
+      names_to = "pos",
+      values_to = "jugador"
+    ) %>%
+    dplyr::filter(!is.na(jugador), jugador != "")
+  
+  players_long %>%
+    dplyr::group_by(season, jugador) %>%
+    dplyr::summarise(
+      partidos_jugados = sum(partidos_jugados),
+      partidos_ganados = sum(partidos_ganados),
+      partidos_perdidos = sum(partidos_perdidos),
+      win_rate = partidos_ganados / partidos_jugados,
+      games_for = sum(games_for),
+      games_against = sum(games_against),
+      diff = sum(diff),
+      bonus_average = sum(bonus_average),
+      puntuacion = sum(puntuacion),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(puntuacion), dplyr::desc(win_rate), dplyr::desc(diff))
+}
+
+# ----------------------------
+# Tabla jugador satélites
+# ----------------------------
+make_player_stats_satellites <- function(sat_df) {
+  
+  sat_df <- sat_df %>%
+    dplyr::mutate(
+      pareja_a = stringr::str_squish(as.character(pareja_a)),
+      pareja_b = stringr::str_squish(as.character(pareja_b)),
+      pareja_a = stringr::str_replace_all(pareja_a, "[–—−]", "-"),
+      pareja_b = stringr::str_replace_all(pareja_b, "[–—−]", "-"),
+      pareja_a = stringr::str_replace_all(pareja_a, "\\s*-\\s*", " - "),
+      pareja_b = stringr::str_replace_all(pareja_b, "\\s*-\\s*", " - ")
+    ) %>%
+    dplyr::filter(
+      !is.na(puntos_a), !is.na(puntos_b),
+      !is.na(pareja_a), !is.na(pareja_b),
+      pareja_a != "", pareja_b != ""
+    ) %>%
+    dplyr::mutate(
+      match_id = dplyr::row_number(),
+      puntos_a = as.numeric(puntos_a),
+      puntos_b = as.numeric(puntos_b)
+    )
+  
+  sat_df <- sat_df %>%
+    dplyr::mutate(
+      completo = pmax(puntos_a, puntos_b, na.rm = TRUE) >= 6
+    )
+  
+  pairs_long <- sat_df %>%
+    dplyr::transmute(
+      match_id, season, jornada, completo,
+      pareja_a, pareja_b,
+      puntos_a, puntos_b
+    ) %>%
+    tidyr::pivot_longer(
+      cols = c(pareja_a, pareja_b),
+      names_to = "lado",
+      values_to = "pareja"
+    ) %>%
+    dplyr::mutate(
+      games_for     = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+      games_against = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+      diff          = games_for - games_against,
+      win           = games_for > games_against
+    ) %>%
+    dplyr::select(match_id, season, jornada, pareja, completo, games_for, games_against, diff, win)
+  
+  pair_jornada <- pairs_long %>%
+    dplyr::group_by(match_id, season, jornada, pareja, completo) %>%
+    dplyr::summarise(
+      partidos_jugados = 1L,
+      partidos_ganados = as.integer(any(win, na.rm = TRUE)),
+      partidos_perdidos = 1L - partidos_ganados,
+      games_for = sum(games_for, na.rm = TRUE),
+      games_against = sum(games_against, na.rm = TRUE),
+      diff = games_for - games_against,
+      .groups = "drop"
+    )
+  
+  players_long <- pair_jornada %>%
+    dplyr::mutate(
+      pareja = stringr::str_squish(as.character(pareja)),
+      pareja = stringr::str_replace_all(pareja, "[–—−]", "-"),
+      pareja = stringr::str_replace_all(pareja, "\\s*-\\s*", " - ")
+    ) %>%
+    tidyr::separate(pareja, into = c("j1", "j2"), sep = " - ", fill = "right") %>%
+    dplyr::mutate(
+      j1 = normalize_player_name(stringr::str_squish(j1)),
+      j2 = normalize_player_name(stringr::str_squish(j2))
+    ) %>%
+    tidyr::pivot_longer(
+      cols = c(j1, j2),
+      names_to = "pos",
+      values_to = "jugador"
+    ) %>%
+    dplyr::filter(!is.na(jugador), jugador != "")
+  
+  players_long <- players_long %>%
+    dplyr::arrange(season, jornada, jugador, match_id) %>%
+    dplyr::group_by(season, jornada, jugador) %>%
+    dplyr::mutate(
+      n_partido_jugador = dplyr::row_number(),
+      is_extra = n_partido_jugador > 3
+    ) %>%
+    dplyr::ungroup()
+  
+  players_long <- players_long %>%
+    dplyr::mutate(
+      pts_diff_gt2 = dplyr::if_else(partidos_ganados == 1L & diff > 2, 0.5, 0.0),
+      pts_ganar = dplyr::case_when(
+        partidos_ganados == 0L ~ 0.0,
+        partidos_ganados == 1L & !is_extra ~ 1.0,
+        partidos_ganados == 1L &  is_extra &  completo ~ 1.0,
+        partidos_ganados == 1L &  is_extra & !completo ~ 0.5,
+        TRUE ~ 0.0
+      ),
+      pts_partido = pts_ganar + pts_diff_gt2
+    )
+  
+  asistencia <- players_long %>%
+    dplyr::distinct(season, jornada, jugador) %>%
+    dplyr::group_by(season, jugador) %>%
+    dplyr::summarise(asistencia_pts = dplyr::n() * 0.5, .groups = "drop")
+  
+  players_long %>%
+    dplyr::group_by(season, jugador) %>%
+    dplyr::summarise(
+      partidos_jugados  = sum(partidos_jugados, na.rm = TRUE),
+      partidos_ganados  = sum(partidos_ganados, na.rm = TRUE),
+      partidos_perdidos = sum(partidos_perdidos, na.rm = TRUE),
+      win_rate          = ifelse(partidos_jugados > 0, partidos_ganados / partidos_jugados, NA_real_),
+      diff              = sum(diff, na.rm = TRUE),
+      puntos_partidos   = sum(pts_partido, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::left_join(asistencia, by = c("season", "jugador")) %>%
+    dplyr::mutate(
+      asistencia_pts = dplyr::coalesce(asistencia_pts, 0),
+      puntuacion_satelite = puntos_partidos + asistencia_pts
+    ) %>%
+    dplyr::arrange(dplyr::desc(puntuacion_satelite), dplyr::desc(win_rate), dplyr::desc(diff))
+}
+
+# ----------------------------
+# Total jugadores (cuadro + satélite)
+# ----------------------------
+make_player_stats_total <- function(players_cuadro, players_satelite) {
+  
+  players_cuadro   <- as.data.frame(players_cuadro)
+  players_satelite <- as.data.frame(players_satelite)
+  
+  get_num <- function(df, col) {
+    if (!col %in% names(df)) return(rep(0, nrow(df)))
+    x <- df[[col]]
+    if (!is.numeric(x)) x <- as.numeric(x)
+    dplyr::coalesce(x, 0)
+  }
+  
+  cuadro <- players_cuadro %>%
+    dplyr::rename_with(~ paste0("cuadro_", .x), -c(season, jugador))
+  
+  sat <- players_satelite %>%
+    dplyr::rename_with(~ paste0("sat_", .x), -c(season, jugador))
+  
+  out <- dplyr::full_join(cuadro, sat, by = c("season", "jugador"))
+  
+  out <- out %>%
+    dplyr::mutate(
+      total_partidos_jugados  = get_num(out, "cuadro_partidos_jugados")  + get_num(out, "sat_partidos_jugados"),
+      total_partidos_ganados  = get_num(out, "cuadro_partidos_ganados")  + get_num(out, "sat_partidos_ganados"),
+      total_partidos_perdidos = get_num(out, "cuadro_partidos_perdidos") + get_num(out, "sat_partidos_perdidos"),
+      total_games_for     = get_num(out, "cuadro_games_for")     + get_num(out, "sat_games_for"),
+      total_games_against = get_num(out, "cuadro_games_against") + get_num(out, "sat_games_against"),
+      total_diff          = get_num(out, "cuadro_diff")          + get_num(out, "sat_diff"),
+      total_win_rate = dplyr::if_else(
+        total_partidos_jugados > 0,
+        total_partidos_ganados / total_partidos_jugados,
+        NA_real_
+      ),
+      total_puntuacion = get_num(out, "cuadro_puntuacion") + get_num(out, "sat_puntuacion_satelite")
+    ) %>%
+    dplyr::arrange(dplyr::desc(total_puntuacion), dplyr::desc(total_win_rate), dplyr::desc(total_diff))
+  
+  out
+}
+
+rename_total_cols_es <- function(df) {
+  map <- c(
+    "season"  = "temporada",
+    "jugador" = "jugador",
+    "cuadro_partidos_jugados"  = "cuadro_partidos_jugados",
+    "cuadro_partidos_ganados"  = "cuadro_partidos_ganados",
+    "cuadro_partidos_perdidos" = "cuadro_partidos_perdidos",
+    "cuadro_win_rate"          = "cuadro_porcentaje_victorias",
+    "cuadro_games_for"         = "cuadro_juegos_a_favor",
+    "cuadro_games_against"     = "cuadro_juegos_en_contra",
+    "cuadro_diff"              = "cuadro_diferencia",
+    "cuadro_bonus_average"     = "cuadro_bonus",
+    "cuadro_puntuacion"        = "cuadro_puntuacion",
+    "sat_partidos_jugados"     = "satelite_partidos_jugados",
+    "sat_partidos_ganados"     = "satelite_partidos_ganados",
+    "sat_partidos_perdidos"    = "satelite_partidos_perdidos",
+    "sat_win_rate"             = "satelite_porcentaje_victorias",
+    "sat_diff"                 = "satelite_diferencia",
+    "sat_puntos_partidos"      = "satelite_puntos_partidos",
+    "sat_asistencia_pts"       = "satelite_puntos_asistencia",
+    "sat_puntuacion_satelite"  = "satelite_puntuacion",
+    "total_partidos_jugados"   = "partidos_jugados_total",
+    "total_partidos_ganados"   = "partidos_ganados_total",
+    "total_partidos_perdidos"  = "partidos_perdidos_total",
+    "total_win_rate"           = "porcentaje_victorias_total",
+    "total_games_for"          = "juegos_a_favor_total",
+    "total_games_against"      = "juegos_en_contra_total",
+    "total_diff"               = "diferencia_total",
+    "total_puntuacion"         = "puntuacion_total"
+  )
+  
+  hits <- intersect(names(map), names(df))
+  names(df)[match(hits, names(df))] <- unname(map[hits])
+  df
+}
+
+# ----------------------------
+# TOTAL por jornada (cuadro + satélite)
+# ----------------------------
+make_player_stats_by_jornada_total <- function(matches_df, sat_df) {
+  
+  # CUADRO por jornada (reutilizando tu lógica)
+  cuadro_j <- {
+    pairs_long <- matches_df %>%
+      dplyr::mutate(
+        pareja_a = stringr::str_squish(pareja_a),
+        pareja_b = stringr::str_squish(pareja_b)
+      ) %>%
+      dplyr::filter(!is.na(puntos_a), !is.na(puntos_b),
+                    pareja_a != "", pareja_b != "") %>%
+      dplyr::transmute(
+        season, jornada,
+        pareja_a, pareja_b,
+        puntos_a = as.numeric(puntos_a),
+        puntos_b = as.numeric(puntos_b)
+      ) %>%
+      tidyr::pivot_longer(
+        cols = c(pareja_a, pareja_b),
+        names_to = "lado",
+        values_to = "pareja"
+      ) %>%
+      dplyr::mutate(
+        games_for     = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+        games_against = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+        win = games_for > games_against
+      ) %>%
+      dplyr::select(season, jornada, pareja, games_for, games_against, win)
+    
+    pair_jornada <- pairs_long %>%
+      dplyr::group_by(season, jornada, pareja) %>%
+      dplyr::summarise(
+        partidos_ganados = sum(win),
+        games_for = sum(games_for, na.rm = TRUE),
+        games_against = sum(games_against, na.rm = TRUE),
+        diff = games_for - games_against,
+        .groups = "drop"
+      )
+    
+    bonus_from_rank <- function(r) {
+      dplyr::case_when(
+        r == 1 ~ 3.0,
+        r == 2 ~ 2.5,
+        r == 3 ~ 2.0,
+        r == 4 ~ 1.5,
+        r == 5 ~ 1.0,
+        r == 6 ~ 0.5,
+        TRUE ~ 0.0
+      )
+    }
+    
+    pair_jornada <- pair_jornada %>%
+      dplyr::group_by(season, jornada) %>%
+      dplyr::mutate(
+        rank_group = dplyr::dense_rank(dplyr::desc(diff)),
+        bonus_average = bonus_from_rank(rank_group),
+        puntuacion = partidos_ganados + bonus_average
+      ) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(-rank_group)
+    
+    pair_jornada %>%
+      tidyr::separate(pareja, into = c("j1", "j2"), sep = "-", fill = "right") %>%
+      dplyr::mutate(
+        j1 = normalize_player_name(stringr::str_squish(j1)),
+        j2 = normalize_player_name(stringr::str_squish(j2))
+      ) %>%
+      tidyr::pivot_longer(cols = c(j1, j2), names_to = "pos", values_to = "jugador") %>%
+      dplyr::filter(!is.na(jugador), jugador != "") %>%
+      dplyr::group_by(season, jornada, jugador) %>%
+      dplyr::summarise(puntos_cuadro = sum(puntuacion, na.rm = TRUE), .groups = "drop")
+  }
+  
+  # SATELITE por jornada
+  sat_clean <- sat_df %>%
+    dplyr::mutate(
+      pareja_a = stringr::str_squish(as.character(pareja_a)),
+      pareja_b = stringr::str_squish(as.character(pareja_b)),
+      pareja_a = stringr::str_replace_all(pareja_a, "[–—−]", "-"),
+      pareja_b = stringr::str_replace_all(pareja_b, "[–—−]", "-"),
+      pareja_a = stringr::str_replace_all(pareja_a, "\\s*-\\s*", " - "),
+      pareja_b = stringr::str_replace_all(pareja_b, "\\s*-\\s*", " - ")
+    ) %>%
+    dplyr::filter(
+      !is.na(puntos_a), !is.na(puntos_b),
+      !is.na(pareja_a), !is.na(pareja_b),
+      pareja_a != "", pareja_b != ""
+    ) %>%
+    dplyr::mutate(
+      match_id = dplyr::row_number(),
+      puntos_a = as.numeric(puntos_a),
+      puntos_b = as.numeric(puntos_b),
+      completo = pmax(puntos_a, puntos_b, na.rm = TRUE) >= 6
+    )
+  
+  pairs_long <- sat_clean %>%
+    dplyr::transmute(
+      match_id, season, jornada, completo,
+      pareja_a, pareja_b, puntos_a, puntos_b
+    ) %>%
+    tidyr::pivot_longer(cols = c(pareja_a, pareja_b), names_to = "lado", values_to = "pareja") %>%
+    dplyr::mutate(
+      games_for     = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+      games_against = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+      diff          = games_for - games_against,
+      win           = games_for > games_against
+    ) %>%
+    dplyr::select(match_id, season, jornada, pareja, completo, diff, win)
+  
+  pair_jornada <- pairs_long %>%
+    dplyr::group_by(match_id, season, jornada, pareja, completo) %>%
+    dplyr::summarise(
+      partidos_ganados  = as.integer(any(win, na.rm = TRUE)),
+      diff              = sum(diff, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  players_long <- pair_jornada %>%
+    dplyr::mutate(
+      pareja = stringr::str_squish(as.character(pareja)),
+      pareja = stringr::str_replace_all(pareja, "[–—−]", "-"),
+      pareja = stringr::str_replace_all(pareja, "\\s*-\\s*", " - ")
+    ) %>%
+    tidyr::separate(pareja, into = c("j1", "j2"), sep = " - ", fill = "right") %>%
+    dplyr::mutate(
+      j1 = normalize_player_name(stringr::str_squish(j1)),
+      j2 = normalize_player_name(stringr::str_squish(j2))
+    ) %>%
+    tidyr::pivot_longer(cols = c(j1, j2), names_to = "pos", values_to = "jugador") %>%
+    dplyr::filter(!is.na(jugador), jugador != "") %>%
+    dplyr::arrange(season, jornada, jugador, match_id) %>%
+    dplyr::group_by(season, jornada, jugador) %>%
+    dplyr::mutate(
+      n_partido_jugador = dplyr::row_number(),
+      is_extra = n_partido_jugador > 3
+    ) %>%
+    dplyr::ungroup()
+  
+  players_long <- players_long %>%
+    dplyr::mutate(
+      pts_diff_gt2 = dplyr::if_else(partidos_ganados == 1L & diff > 2, 0.5, 0.0),
+      pts_ganar = dplyr::case_when(
+        partidos_ganados == 0L ~ 0.0,
+        partidos_ganados == 1L & !is_extra ~ 1.0,
+        partidos_ganados == 1L &  is_extra &  completo ~ 1.0,
+        partidos_ganados == 1L &  is_extra & !completo ~ 0.5,
+        TRUE ~ 0.0
+      ),
+      pts_partido = pts_ganar + pts_diff_gt2
+    )
+  
+  asistencia_j <- players_long %>%
+    dplyr::distinct(season, jornada, jugador) %>%
+    dplyr::mutate(asistencia_pts = 0.5)
+  
+  sat_j <- players_long %>%
+    dplyr::group_by(season, jornada, jugador) %>%
+    dplyr::summarise(puntos_partidos = sum(pts_partido, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::left_join(asistencia_j, by = c("season", "jornada", "jugador")) %>%
+    dplyr::mutate(
+      asistencia_pts = dplyr::coalesce(asistencia_pts, 0),
+      puntos_sat = puntos_partidos + asistencia_pts
+    ) %>%
+    dplyr::select(season, jornada, jugador, puntos_sat)
+  
+  dplyr::full_join(cuadro_j, sat_j, by = c("season", "jornada", "jugador")) %>%
+    dplyr::mutate(
+      puntos_cuadro = dplyr::coalesce(puntos_cuadro, 0),
+      puntos_sat    = dplyr::coalesce(puntos_sat, 0),
+      puntuacion_total = puntos_cuadro + puntos_sat
+    ) %>%
+    dplyr::select(season, jornada, jugador, puntuacion_total) %>%
+    dplyr::arrange(season, jornada, dplyr::desc(puntuacion_total))
+}
+
+# ----------------------------
+# Datos para Bar Chart Race (acumulado)
+# Devuelve puntos_acum + rank por jornada + color automático por jugador
+# ----------------------------
+make_rank_race_data <- function(df_by_jornada_total, top_n = 10) {
+  
+  df <- df_by_jornada_total %>%
+    dplyr::mutate(
+      jornada = as.integer(jornada),
+      puntos_jornada = suppressWarnings(as.numeric(puntuacion_total)),
+      jugador = as.character(jugador)
+    ) %>%
+    dplyr::filter(!is.na(jornada), !is.na(jugador), jugador != "")
+  
+  if (nrow(df) == 0) return(tibble::tibble())
+  
+  jornadas_all <- sort(unique(df$jornada))
+  
+  df_full <- df %>%
+    dplyr::select(season, jornada, jugador, puntos_jornada) %>%
+    tidyr::complete(
+      season,
+      jornada = jornadas_all,
+      jugador,
+      fill = list(puntos_jornada = 0)
+    ) %>%
+    dplyr::arrange(season, jugador, jornada) %>%
+    dplyr::group_by(season, jugador) %>%
+    dplyr::mutate(puntos_acum = cumsum(dplyr::coalesce(puntos_jornada, 0))) %>%
+    dplyr::ungroup()
+  
+  top_n <- as.integer(top_n)
+  
+  ranked <- df_full %>%
+    dplyr::group_by(season, jornada) %>%
+    dplyr::arrange(dplyr::desc(puntos_acum), jugador, .by_group = TRUE) %>%
+    dplyr::mutate(rank = dplyr::row_number()) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(rank <= top_n)
+  
+  # Colores automáticos (consistentes por jugador)
+  players <- sort(unique(ranked$jugador))
+  pal <- grDevices::hcl.colors(length(players), palette = "Dark 3")
+  color_map <- tibble::tibble(jugador = players, color = pal)
+  
+  ranked <- ranked %>%
+    dplyr::left_join(color_map, by = "jugador") %>%
+    dplyr::mutate(
+      y_rank = rank,
+      puntos_txt = format(round(puntos_acum, 1), decimal.mark = ",", nsmall = 1),
+      label_out = paste0(jugador, "   ", puntos_txt, " pts")
+    )
+  
+  ranked
+}
+
+# ----------------------------
+# Mayor remontada/caída TOTAL (respetando el tiempo)
+# ----------------------------
+compute_biggest_swings_total <- function(df_by_jornada_total) {
+  
+  df <- df_by_jornada_total %>%
+    dplyr::mutate(
+      jornada = as.integer(jornada),
+      puntos_jornada = suppressWarnings(as.numeric(puntuacion_total)),
+      jugador = as.character(jugador)
+    ) %>%
+    dplyr::filter(!is.na(jornada), !is.na(jugador), jugador != "")
+  
+  if (nrow(df) == 0) return(list(comeback_total = NULL, drop_total = NULL))
+  
+  jornadas_all <- sort(unique(df$jornada))
+  
+  full <- df %>%
+    dplyr::select(season, jornada, jugador, puntos_jornada) %>%
+    tidyr::complete(
+      season,
+      jornada = jornadas_all,
+      jugador,
+      fill = list(puntos_jornada = 0)
+    ) %>%
+    dplyr::arrange(season, jugador, jornada) %>%
+    dplyr::group_by(season, jugador) %>%
+    dplyr::mutate(puntos_acum = cumsum(dplyr::coalesce(puntos_jornada, 0))) %>%
+    dplyr::ungroup()
+  
+  ranks <- full %>%
+    dplyr::group_by(season, jornada) %>%
+    dplyr::arrange(dplyr::desc(puntos_acum), jugador, .by_group = TRUE) %>%
+    dplyr::mutate(rank = dplyr::row_number()) %>%
+    dplyr::ungroup()
+  
+  swings <- ranks %>%
+    dplyr::arrange(season, jugador, jornada) %>%
+    dplyr::group_by(season, jugador) %>%
+    dplyr::group_modify(~{
+      x <- .x
+      
+      worst_rank_so_far <- -Inf
+      worst_j_so_far <- NA_integer_
+      best_impr <- -Inf
+      impr_from_rank <- NA_integer_
+      impr_from_j <- NA_integer_
+      impr_to_rank <- NA_integer_
+      impr_to_j <- NA_integer_
+      
+      best_rank_so_far <- Inf
+      best_j_so_far <- NA_integer_
+      best_drop <- -Inf
+      drop_from_rank <- NA_integer_
+      drop_from_j <- NA_integer_
+      drop_to_rank <- NA_integer_
+      drop_to_j <- NA_integer_
+      
+      for (i in seq_len(nrow(x))) {
+        r <- x$rank[i]
+        j <- x$jornada[i]
+        
+        if (r > worst_rank_so_far) {
+          worst_rank_so_far <- r
+          worst_j_so_far <- j
+        }
+        impr <- worst_rank_so_far - r
+        if (impr > best_impr) {
+          best_impr <- impr
+          impr_from_rank <- worst_rank_so_far
+          impr_from_j <- worst_j_so_far
+          impr_to_rank <- r
+          impr_to_j <- j
+        }
+        
+        if (r < best_rank_so_far) {
+          best_rank_so_far <- r
+          best_j_so_far <- j
+        }
+        drp <- r - best_rank_so_far
+        if (drp > best_drop) {
+          best_drop <- drp
+          drop_from_rank <- best_rank_so_far
+          drop_from_j <- best_j_so_far
+          drop_to_rank <- r
+          drop_to_j <- j
+        }
+      }
+      
+      tibble::tibble(
+        comeback_delta = as.integer(best_impr),
+        comeback_from_rank = impr_from_rank,
+        comeback_from_jornada = impr_from_j,
+        comeback_to_rank = impr_to_rank,
+        comeback_to_jornada = impr_to_j,
+        
+        drop_delta = as.integer(best_drop),
+        drop_from_rank = drop_from_rank,
+        drop_from_jornada = drop_from_j,
+        drop_to_rank = drop_to_rank,
+        drop_to_jornada = drop_to_j
+      )
+    }) %>%
+    dplyr::ungroup()
+  
+  best_comeback <- swings %>%
+    dplyr::arrange(dplyr::desc(comeback_delta), season, jugador) %>%
+    dplyr::slice_head(n = 1)
+  
+  worst_drop <- swings %>%
+    dplyr::arrange(dplyr::desc(drop_delta), season, jugador) %>%
+    dplyr::slice_head(n = 1)
+  
+  list(comeback_total = best_comeback, drop_total = worst_drop)
+}
+
+##########parejas
+# ==========================================================
+# PAREJAS (CUADRO): stats por pareja
+# ==========================================================
+make_pair_stats_cuadro <- function(matches_df) {
+  
+  df <- matches_df %>%
+    dplyr::mutate(
+      pareja_a = normalize_pair(pareja_a),   # en cuadro venía "A-B" pero aquí lo normalizamos
+      pareja_b = normalize_pair(pareja_b),
+      puntos_a = as.numeric(puntos_a),
+      puntos_b = as.numeric(puntos_b)
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b),
+                  !is.na(pareja_a), !is.na(pareja_b),
+                  pareja_a != "", pareja_b != "")
+  
+  pairs_long <- df %>%
+    dplyr::transmute(
+      season, jornada,
+      pareja_a, pareja_b, puntos_a, puntos_b
+    ) %>%
+    tidyr::pivot_longer(cols = c(pareja_a, pareja_b),
+                        names_to = "lado", values_to = "pareja") %>%
+    dplyr::mutate(
+      games_for     = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+      games_against = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+      win = games_for > games_against
+    ) %>%
+    dplyr::select(season, pareja, games_for, games_against, win)
+  
+  pairs_long %>%
+    dplyr::group_by(season, pareja) %>%
+    dplyr::summarise(
+      partidos_jugados  = dplyr::n(),
+      partidos_ganados  = sum(win, na.rm = TRUE),
+      partidos_perdidos = partidos_jugados - partidos_ganados,
+      win_rate          = ifelse(partidos_jugados > 0, partidos_ganados / partidos_jugados, NA_real_),
+      games_for         = sum(games_for, na.rm = TRUE),
+      games_against     = sum(games_against, na.rm = TRUE),
+      diff              = games_for - games_against,
+      puntos            = partidos_ganados, # puedes cambiar si quieres reglas de puntos para parejas
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(puntos), dplyr::desc(win_rate), dplyr::desc(diff))
+}
+
+# ==========================================================
+# PAREJAS (SAT): stats por pareja
+# ==========================================================
+make_pair_stats_satellites <- function(sat_df) {
+  
+  df <- sat_df %>%
+    dplyr::mutate(
+      pareja_a = normalize_pair(pareja_a),  # en sat ya venía "A - B"
+      pareja_b = normalize_pair(pareja_b),
+      puntos_a = as.numeric(puntos_a),
+      puntos_b = as.numeric(puntos_b)
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b),
+                  !is.na(pareja_a), !is.na(pareja_b),
+                  pareja_a != "", pareja_b != "")
+  
+  pairs_long <- df %>%
+    dplyr::transmute(season, pareja_a, pareja_b, puntos_a, puntos_b) %>%
+    tidyr::pivot_longer(cols = c(pareja_a, pareja_b),
+                        names_to = "lado", values_to = "pareja") %>%
+    dplyr::mutate(
+      games_for     = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+      games_against = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+      win = games_for > games_against
+    ) %>%
+    dplyr::select(season, pareja, games_for, games_against, win)
+  
+  pairs_long %>%
+    dplyr::group_by(season, pareja) %>%
+    dplyr::summarise(
+      partidos_jugados  = dplyr::n(),
+      partidos_ganados  = sum(win, na.rm = TRUE),
+      partidos_perdidos = partidos_jugados - partidos_ganados,
+      win_rate          = ifelse(partidos_jugados > 0, partidos_ganados / partidos_jugados, NA_real_),
+      games_for         = sum(games_for, na.rm = TRUE),
+      games_against     = sum(games_against, na.rm = TRUE),
+      diff              = games_for - games_against,
+      puntos            = partidos_ganados, # idem
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(puntos), dplyr::desc(win_rate), dplyr::desc(diff))
+}
+
+#########################################################
+# ==========================================================
+# SIMULADOR PARTIDOS: helpers + features + predicción
+# ==========================================================
+
+# --- Normaliza separadores de pareja y ordena jugadores (A - B == B - A)
+normalize_pair <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_squish(x)
+  x <- stringr::str_replace_all(x, "[–—−]", "-")
+  x <- stringr::str_replace_all(x, "\\s*-\\s*", " - ")
+  
+  parts <- stringr::str_split_fixed(x, " - ", 2)
+  j1 <- normalize_player_name(stringr::str_squish(parts[, 1]))
+  j2 <- normalize_player_name(stringr::str_squish(parts[, 2]))
+  
+  k1 <- stringi::stri_trans_general(j1, "Latin-ASCII") |> toupper() |> stringr::str_squish()
+  k2 <- stringi::stri_trans_general(j2, "Latin-ASCII") |> toupper() |> stringr::str_squish()
+  swap <- k2 < k1
+  
+  j1_out <- ifelse(swap, j2, j1)
+  j2_out <- ifelse(swap, j1, j2)
+  
+  stringr::str_squish(paste(j1_out, j2_out, sep = " - "))
+}
+
+# --- Key normalizada para joins robustos
+key_norm <- function(x) {
+  x <- as.character(x)
+  x <- stringi::stri_trans_general(x, "Latin-ASCII")
+  x <- toupper(x)
+  stringr::str_squish(x)
+}
+
+# --- Min-max seguro
+minmax01 <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1]) || !is.finite(rng[2]) || rng[1] == rng[2]) {
+    return(rep(0.5, length(x)))
+  }
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+# ----------------------------------------------------------
+# Features individuales globales (a partir de players_total_f())
+# Devuelve: jugador, win_rate, diff_per_match, points_per_match, exp_scaled
+# ----------------------------------------------------------
+compute_player_features_global <- function(players_total_df) {
+  df <- players_total_df %>%
+    dplyr::mutate(
+      jugador = as.character(jugador),
+      jugador_key = key_norm(jugador),
+      total_win_rate = suppressWarnings(as.numeric(total_win_rate)),
+      total_diff = suppressWarnings(as.numeric(total_diff)),
+      total_puntuacion = suppressWarnings(as.numeric(total_puntuacion)),
+      total_partidos_jugados = suppressWarnings(as.numeric(total_partidos_jugados))
+    ) %>%
+    dplyr::filter(!is.na(jugador_key), jugador_key != "")
+  
+  df <- df %>%
+    dplyr::mutate(
+      diff_per_match = dplyr::if_else(total_partidos_jugados > 0, total_diff / total_partidos_jugados, 0),
+      points_per_match = dplyr::if_else(total_partidos_jugados > 0, total_puntuacion / total_partidos_jugados, 0),
+      exp_scaled = minmax01(total_partidos_jugados)
+    )
+  
+  df %>%
+    dplyr::select(jugador, jugador_key, total_win_rate, diff_per_match, points_per_match, exp_scaled)
+}
+
+# ----------------------------------------------------------
+# Features individuales recientes (últimas k jornadas)
+# A partir de players_by_jornada_f(): season, jornada, jugador, puntuacion_total
+# Devuelve: jugador_key, recent_points_mean, recent_points_trend
+# ----------------------------------------------------------
+compute_player_features_recent <- function(players_by_jornada_total_df, k_last = 3) {
+  df <- players_by_jornada_total_df %>%
+    dplyr::mutate(
+      jugador = as.character(jugador),
+      jugador_key = key_norm(jugador),
+      jornada = as.integer(jornada),
+      pts = suppressWarnings(as.numeric(puntuacion_total))
+    ) %>%
+    dplyr::filter(!is.na(jornada), !is.na(jugador_key), jugador_key != "")
+  
+  if (nrow(df) == 0) {
+    return(tibble::tibble(
+      jugador_key = character(),
+      recent_points_mean = numeric(),
+      recent_points_trend = numeric()
+    ))
+  }
+  
+  jmax <- max(df$jornada, na.rm = TRUE)
+  jmin <- max(1, jmax - as.integer(k_last) + 1)
+  
+  w <- df %>% dplyr::filter(jornada >= jmin, jornada <= jmax)
+  
+  # media + tendencia simple (última - primera)
+  out <- w %>%
+    dplyr::group_by(jugador_key) %>%
+    dplyr::summarise(
+      recent_points_mean = mean(pts, na.rm = TRUE),
+      recent_points_trend = dplyr::last(pts) - dplyr::first(pts),
+      .groups = "drop"
+    )
+  
+  out
+}
+
+# ----------------------------------------------------------
+# Sinergia de pareja (win_rate y diff medio cuando juegan juntos)
+# Usa matches_f() y satellites_f() ya filtrados por season/trimestre/jornada si quieres
+# Devuelve: pareja_norm, pair_matches, pair_win_rate, pair_diff_mean
+# ----------------------------------------------------------
+# ----------------------------------------------------------
+# Features recientes por ÚLTIMOS N PARTIDOS (cuadro + satélite)
+# Devuelve: jugador_key, recent_win_rate, recent_diff_mean, recent_matches
+# ----------------------------------------------------------
+compute_player_features_recent_matches <- function(matches_df, sat_df, n_last = 6) {
+  
+  # --- CUADRO -> partidos jugador ---
+  cu <- matches_df %>%
+    dplyr::mutate(
+      pareja_a = as.character(pareja_a),
+      pareja_b = as.character(pareja_b),
+      puntos_a = suppressWarnings(as.numeric(puntos_a)),
+      puntos_b = suppressWarnings(as.numeric(puntos_b))
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pareja_a != "", pareja_b != "") %>%
+    dplyr::mutate(
+      match_id = dplyr::row_number(),
+      # en cuadro vienen sin espacios: "A-B"
+      pareja_a = stringr::str_squish(pareja_a),
+      pareja_b = stringr::str_squish(pareja_b)
+    ) %>%
+    tidyr::pivot_longer(cols = c(pareja_a, pareja_b), names_to = "lado", values_to = "pareja") %>%
+    dplyr::mutate(
+      gf = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+      ga = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+      win = gf > ga,
+      diff = gf - ga
+    ) %>%
+    dplyr::select(match_id, season, jornada, pareja, win, diff)
+  
+  cu_players <- cu %>%
+    tidyr::separate(pareja, into = c("j1","j2"), sep = "-", fill = "right") %>%
+    dplyr::mutate(
+      j1 = normalize_player_name(stringr::str_squish(j1)),
+      j2 = normalize_player_name(stringr::str_squish(j2))
+    ) %>%
+    tidyr::pivot_longer(cols = c(j1,j2), names_to = "pos", values_to = "jugador") %>%
+    dplyr::filter(!is.na(jugador), jugador != "") %>%
+    dplyr::mutate(jugador_key = key_norm(jugador)) %>%
+    dplyr::select(season, jornada, match_id, jugador_key, win, diff)
+  
+  # --- SAT -> partidos jugador ---
+  sa <- sat_df %>%
+    dplyr::mutate(
+      pareja_a = as.character(pareja_a),
+      pareja_b = as.character(pareja_b),
+      puntos_a = suppressWarnings(as.numeric(puntos_a)),
+      puntos_b = suppressWarnings(as.numeric(puntos_b))
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pareja_a != "", pareja_b != "") %>%
+    dplyr::mutate(
+      match_id = dplyr::row_number(),
+      # en sat vienen con espacios: "A - B"
+      pareja_a = stringr::str_replace_all(stringr::str_squish(pareja_a), "\\s*-\\s*", " - "),
+      pareja_b = stringr::str_replace_all(stringr::str_squish(pareja_b), "\\s*-\\s*", " - ")
+    ) %>%
+    tidyr::pivot_longer(cols = c(pareja_a, pareja_b), names_to = "lado", values_to = "pareja") %>%
+    dplyr::mutate(
+      gf = dplyr::if_else(lado == "pareja_a", puntos_a, puntos_b),
+      ga = dplyr::if_else(lado == "pareja_a", puntos_b, puntos_a),
+      win = gf > ga,
+      diff = gf - ga
+    ) %>%
+    dplyr::select(match_id, season, jornada, pareja, win, diff)
+  
+  sa_players <- sa %>%
+    tidyr::separate(pareja, into = c("j1","j2"), sep = " - ", fill = "right") %>%
+    dplyr::mutate(
+      j1 = normalize_player_name(stringr::str_squish(j1)),
+      j2 = normalize_player_name(stringr::str_squish(j2))
+    ) %>%
+    tidyr::pivot_longer(cols = c(j1,j2), names_to = "pos", values_to = "jugador") %>%
+    dplyr::filter(!is.na(jugador), jugador != "") %>%
+    dplyr::mutate(jugador_key = key_norm(jugador)) %>%
+    dplyr::select(season, jornada, match_id, jugador_key, win, diff)
+  
+  allm <- dplyr::bind_rows(cu_players, sa_players)
+  
+  if (nrow(allm) == 0) {
+    return(tibble::tibble(
+      jugador_key = character(),
+      recent_win_rate = numeric(),
+      recent_diff_mean = numeric(),
+      recent_matches = integer()
+    ))
+  }
+  
+  # orden temporal aproximado: season + jornada + match_id
+  allm <- allm %>% dplyr::arrange(season, jornada, match_id)
+  
+  # últimos N partidos por jugador
+  n_last <- as.integer(n_last)
+  
+  out <- allm %>%
+    dplyr::group_by(jugador_key) %>%
+    dplyr::group_modify(~{
+      x <- .x
+      x <- utils::tail(x, n_last)
+      tibble::tibble(
+        recent_matches  = nrow(x),
+        recent_win_rate = mean(x$win,  na.rm = TRUE),
+        recent_diff_mean= mean(x$diff, na.rm = TRUE)
+      )
+    }) %>%
+    dplyr::ungroup()
+  
+  out
+}
+
+# ----------------------------------------------------------
+# Scoring final: rating de jugador + bonus sinergia pareja -> prob victoria
+predict_match_winner <- function(
+    players_total_df,
+    matches_df,
+    sat_df,
+    A1, A2, B1, B2,
+    n_last = 6
+) {
+  # --- features globales ---
+  g <- compute_player_features_global(players_total_df)
+  
+  # --- features recientes por últimos N PARTIDOS ---
+  n_last <- as.integer(n_last)
+  r <- compute_player_features_recent_matches(matches_df, sat_df, n_last = n_last)
+  
+  # join global + reciente (si no hay reciente -> 0/NA controlado)
+  feats <- g %>%
+    dplyr::left_join(r, by = "jugador_key") %>%
+    dplyr::mutate(
+      recent_matches  = dplyr::coalesce(recent_matches, 0L),
+      recent_win_rate = dplyr::coalesce(recent_win_rate, 0.5),
+      recent_diff_mean= dplyr::coalesce(recent_diff_mean, 0)
+    )
+  
+  # normalizaciones
+  feats <- feats %>%
+    dplyr::mutate(
+      win01   = dplyr::coalesce(total_win_rate, 0.5),
+      diff01  = minmax01(diff_per_match),
+      ppm01   = minmax01(points_per_match),
+      rwin01  = dplyr::coalesce(recent_win_rate, 0.5),
+      rdiff01 = minmax01(recent_diff_mean),
+      exp01   = dplyr::coalesce(exp_scaled, 0.5)
+    )
+  
+  # rating individual (mezcla histórico + forma reciente)
+  feats <- feats %>%
+    dplyr::mutate(
+      rating = 0.35 * win01 +
+        0.20 * diff01 +
+        0.20 * ppm01 +
+        0.15 * rwin01 +
+        0.05 * rdiff01 +
+        0.05 * exp01
+    )
+  
+  # helper rating por jugador
+  get_rating <- function(name) {
+    k <- key_norm(name)
+    row <- feats %>% dplyr::filter(jugador_key == k) %>% dplyr::slice_head(n = 1)
+    if (nrow(row) == 0) return(list(r = 0.5, row = NULL))
+    list(r = row$rating[1], row = row)
+  }
+  
+  a1 <- get_rating(A1); a2 <- get_rating(A2); b1 <- get_rating(B1); b2 <- get_rating(B2)
+  
+  baseA <- a1$r + a2$r
+  baseB <- b1$r + b2$r
+  
+  # --- sinergia pareja ---
+  syn <- compute_pair_synergy(matches_df, sat_df)
+  pairA <- normalize_pair(paste(A1, A2, sep = " - "))
+  pairB <- normalize_pair(paste(B1, B2, sep = " - "))
+  
+  # ==========================================================
+  # H2H bonus (Pareja A vs Pareja B)
+  # ==========================================================
+  h2h <- compute_h2h_pair_vs_pair(matches_df, sat_df, pairA, pairB)
+  
+  # Bonus por H2H:
+  # - se centra en 0.5 (neutral)
+  # - aumenta con nº enfrentamientos (confianza)
+  # - usa también diff medio para separar "ganar sufriendo" vs "ganar fácil"
+  h2h_bonus <- 0
+  if (!is.na(h2h$h2h_win_rate_A) && h2h$h2h_matches > 0) {
+    
+    conf_h2h <- pmin(1, sqrt(h2h$h2h_matches) / 4)  # 4 enfrentamientos -> conf ~1
+    wr_term  <- (h2h$h2h_win_rate_A - 0.5)          # [-0.5, +0.5]
+    
+    # diff mean lo pasamos a escala suave con tanh (evita valores locos)
+    diff_term <- tanh(h2h$h2h_diff_mean_A / 3)      # aprox [-1,1]
+    
+    # peso global del H2H 
+    h2h_bonus <- conf_h2h * (0.2 * wr_term + 0.10 * diff_term)
+  }
+  
+  synA <- syn %>% dplyr::filter(pareja_norm == pairA) %>% dplyr::slice_head(n = 1)
+  synB <- syn %>% dplyr::filter(pareja_norm == pairB) %>% dplyr::slice_head(n = 1)
+  
+  bonus_syn <- function(syn_row) {
+    if (is.null(syn_row) || nrow(syn_row) == 0) return(0)
+    m  <- syn_row$pair_matches[1]
+    wr <- syn_row$pair_win_rate[1]
+    conf <- pmin(1, sqrt(m) / 5)
+    conf * (wr - 0.5) * 0.40
+  }
+  
+  bonusA <- bonus_syn(synA)
+  bonusB <- bonus_syn(synB)
+  
+  ratingA <- baseA + bonusA + h2h_bonus
+  ratingB <- baseB + bonusB - h2h_bonus
+  
+  # probabilidad logística
+  temp <- 3.0
+  pA <- 1 / (1 + exp(-(ratingA - ratingB) * temp))
+  pB <- 1 - pA
+  
+  # detalle jugadores (con campos recientes correctos)
+  detail_players <- dplyr::bind_rows(
+    if (!is.null(a1$row)) a1$row %>% dplyr::mutate(role = "A1") else NULL,
+    if (!is.null(a2$row)) a2$row %>% dplyr::mutate(role = "A2") else NULL,
+    if (!is.null(b1$row)) b1$row %>% dplyr::mutate(role = "B1") else NULL,
+    if (!is.null(b2$row)) b2$row %>% dplyr::mutate(role = "B2") else NULL
+  ) %>%
+    dplyr::select(
+      role, jugador,
+      total_win_rate, diff_per_match, points_per_match,
+      recent_matches, recent_win_rate, recent_diff_mean,
+      exp_scaled, rating
+    )
+  
+  detail_pairs <- tibble::tibble(
+    pareja = c(pairA, pairB),
+    side = c("A", "B"),
+    base_rating = c(baseA, baseB),
+    synergy_bonus = c(bonusA, bonusB),
+    final_rating = c(ratingA, ratingB),
+    synergy_matches = c(ifelse(nrow(synA)==0, 0, synA$pair_matches[1]),
+                        ifelse(nrow(synB)==0, 0, synB$pair_matches[1])),
+    synergy_win_rate = c(ifelse(nrow(synA)==0, NA_real_, synA$pair_win_rate[1]),
+                         ifelse(nrow(synB)==0, NA_real_, synB$pair_win_rate[1]))
+  )
+  
+  list(
+    pairA = pairA, pairB = pairB,
+    ratingA = ratingA, ratingB = ratingB,
+    pA = pA, pB = pB,
+    detail_players = detail_players,
+    detail_pairs = detail_pairs
+  )
+}
+
+# ----------------------------------------------------------
+# H2H: Pareja A vs Pareja B (cuadro + satélite)
+# Devuelve stats desde perspectiva de A
+# ----------------------------------------------------------
+compute_h2h_pair_vs_pair <- function(matches_df, sat_df, pairA, pairB) {
+  
+  pairA <- normalize_pair(pairA)
+  pairB <- normalize_pair(pairB)
+  
+  # ---- CUADRO ----
+  cu <- matches_df %>%
+    dplyr::mutate(
+      pa = normalize_pair(pareja_a),
+      pb = normalize_pair(pareja_b),
+      puntos_a = suppressWarnings(as.numeric(puntos_a)),
+      puntos_b = suppressWarnings(as.numeric(puntos_b))
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pa != "", pb != "") %>%
+    dplyr::transmute(pa, pb, puntos_a, puntos_b)
+  
+  cu_h2h <- cu %>%
+    dplyr::filter((pa == pairA & pb == pairB) | (pa == pairB & pb == pairA)) %>%
+    dplyr::mutate(
+      gf_A = dplyr::if_else(pa == pairA, puntos_a, puntos_b),
+      ga_A = dplyr::if_else(pa == pairA, puntos_b, puntos_a),
+      win_A = gf_A > ga_A,
+      diff_A = gf_A - ga_A
+    ) %>%
+    dplyr::select(win_A, diff_A)
+  
+  # ---- SAT ----
+  sa <- sat_df %>%
+    dplyr::mutate(
+      pa = normalize_pair(pareja_a),
+      pb = normalize_pair(pareja_b),
+      puntos_a = suppressWarnings(as.numeric(puntos_a)),
+      puntos_b = suppressWarnings(as.numeric(puntos_b))
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pa != "", pb != "") %>%
+    dplyr::transmute(pa, pb, puntos_a, puntos_b)
+  
+  sa_h2h <- sa %>%
+    dplyr::filter((pa == pairA & pb == pairB) | (pa == pairB & pb == pairA)) %>%
+    dplyr::mutate(
+      gf_A = dplyr::if_else(pa == pairA, puntos_a, puntos_b),
+      ga_A = dplyr::if_else(pa == pairA, puntos_b, puntos_a),
+      win_A = gf_A > ga_A,
+      diff_A = gf_A - ga_A
+    ) %>%
+    dplyr::select(win_A, diff_A)
+  
+  h2h <- dplyr::bind_rows(cu_h2h, sa_h2h)
+  
+  if (nrow(h2h) == 0) {
+    return(list(
+      h2h_matches = 0L,
+      h2h_win_rate_A = NA_real_,
+      h2h_diff_mean_A = NA_real_
+    ))
+  }
+  
+  list(
+    h2h_matches = nrow(h2h),
+    h2h_win_rate_A = mean(h2h$win_A, na.rm = TRUE),
+    h2h_diff_mean_A = mean(h2h$diff_A, na.rm = TRUE)
+  )
+}
+
+
+# ----------------------------------------------------------
+# Sinergia de pareja (cuadro + sat)
+# Devuelve: pareja_norm, pair_matches, pair_win_rate, pair_diff_mean
+# ----------------------------------------------------------
+compute_pair_synergy <- function(matches_df, sat_df) {
+  
+  # CUADRO
+  cu <- matches_df %>%
+    dplyr::mutate(
+      pa = normalize_pair(pareja_a),
+      pb = normalize_pair(pareja_b),
+      puntos_a = suppressWarnings(as.numeric(puntos_a)),
+      puntos_b = suppressWarnings(as.numeric(puntos_b))
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pa != "", pb != "") %>%
+    dplyr::transmute(
+      pareja = pa, gf = puntos_a, ga = puntos_b
+    ) %>%
+    dplyr::bind_rows(
+      matches_df %>%
+        dplyr::mutate(
+          pa = normalize_pair(pareja_a),
+          pb = normalize_pair(pareja_b),
+          puntos_a = suppressWarnings(as.numeric(puntos_a)),
+          puntos_b = suppressWarnings(as.numeric(puntos_b))
+        ) %>%
+        dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pa != "", pb != "") %>%
+        dplyr::transmute(
+          pareja = pb, gf = puntos_b, ga = puntos_a
+        )
+    )
+  
+  # SAT
+  sa <- sat_df %>%
+    dplyr::mutate(
+      pa = normalize_pair(pareja_a),
+      pb = normalize_pair(pareja_b),
+      puntos_a = suppressWarnings(as.numeric(puntos_a)),
+      puntos_b = suppressWarnings(as.numeric(puntos_b))
+    ) %>%
+    dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pa != "", pb != "") %>%
+    dplyr::transmute(
+      pareja = pa, gf = puntos_a, ga = puntos_b
+    ) %>%
+    dplyr::bind_rows(
+      sat_df %>%
+        dplyr::mutate(
+          pa = normalize_pair(pareja_a),
+          pb = normalize_pair(pareja_b),
+          puntos_a = suppressWarnings(as.numeric(puntos_a)),
+          puntos_b = suppressWarnings(as.numeric(puntos_b))
+        ) %>%
+        dplyr::filter(!is.na(puntos_a), !is.na(puntos_b), pa != "", pb != "") %>%
+        dplyr::transmute(
+          pareja = pb, gf = puntos_b, ga = puntos_a
+        )
+    )
+  
+  allp <- dplyr::bind_rows(cu, sa)
+  
+  if (nrow(allp) == 0) {
+    return(tibble::tibble(
+      pareja_norm = character(),
+      pair_matches = integer(),
+      pair_win_rate = numeric(),
+      pair_diff_mean = numeric()
+    ))
+  }
+  
+  allp %>%
+    dplyr::mutate(
+      win = gf > ga,
+      diff = gf - ga,
+      pareja_norm = pareja
+    ) %>%
+    dplyr::group_by(pareja_norm) %>%
+    dplyr::summarise(
+      pair_matches = dplyr::n(),
+      pair_win_rate = mean(win, na.rm = TRUE),
+      pair_diff_mean = mean(diff, na.rm = TRUE),
+      .groups = "drop"
+    )
+}

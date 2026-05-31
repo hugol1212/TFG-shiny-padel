@@ -7,6 +7,15 @@ library(stringi)
 library(tibble)
 library(purrr)
 
+load_data <- function(data_dir = "data/clean") {
+  list(
+    calendar = readRDS(file.path(data_dir, "calendar.rds")),
+    finance = readRDS(file.path(data_dir, "finance.rds")),
+    matches = readRDS(file.path(data_dir, "matches_all.rds")),
+    satellites = readRDS(file.path(data_dir, "satellites_only.rds")),
+    matches_plus_satellites = readRDS(file.path(data_dir, "matches_plus_satellites.rds"))
+  )
+}
 # ----------------------------
 # Diccionario: alias -> nombre corto (CANÓNICO)
 # ----------------------------
